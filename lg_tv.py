@@ -10,11 +10,26 @@ from pywebostv.connection import WebOSClient
 from pywebostv.controls import SourceControl
 
 
-TV_IP = "192.168.1.177"
-TV_MAC = "d8:e3:5e:52:e5:24"
-TARGET_INPUT = "HDMI_4"
+def require_env(name):
+    value = os.environ.get(name)
+
+    if not value:
+        raise RuntimeError(
+            f"Required environment variable {name} is not set."
+        )
+
+    return value
+
+
+TV_IP = require_env("TV_IP")
+TV_MAC = require_env("TV_MAC")
+TARGET_INPUT = require_env("TARGET_INPUT")
 
 PAIRING_FILE = os.path.expanduser("~/.lg_webos_key.json")
+
+TV_REACHABLE_TIMEOUT = 20
+WEBOS_CONNECT_TIMEOUT = 30
+WEBOS_RETRY_DELAY = 2
 
 
 def load_store():
@@ -30,7 +45,13 @@ def save_store(store):
         json.dump(store, f)
 
 
-def wait_for_tv(host, port=3001, timeout=20):
+def wait_for_tv(host, port=3001, timeout=TV_REACHABLE_TIMEOUT):
+    """
+    Wait until the TV's secure webOS TCP port begins accepting connections.
+
+    This only tells us that the TV's network stack is awake. It does not
+    guarantee that webOS is ready to accept commands yet.
+    """
     print("Waiting for TV webOS service...")
 
     deadline = time.time() + timeout
@@ -46,77 +67,134 @@ def wait_for_tv(host, port=3001, timeout=20):
     return False
 
 
-def main():
-    # Wake the TV
-    print(f"Waking TV at {TV_MAC}...")
-    wake(TV_MAC)
+def connect_webos(
+    store,
+    timeout=WEBOS_CONNECT_TIMEOUT,
+    retry_delay=WEBOS_RETRY_DELAY,
+    register_timeout=3,
+):
+    """
+    Retry complete webOS sessions until registration succeeds.
 
-    # Wait for webOS to become available
-    if not wait_for_tv(TV_IP):
-        raise RuntimeError("TV did not become reachable.")
+    Each registration attempt is intentionally short so a half-awake TV
+    cannot consume the entire overall retry budget.
+    """
+    deadline = time.time() + timeout
+    attempt = 1
+    last_error = None
 
-    print("Waiting for webOS services to finish waking...")
-    time.sleep(7)
-    # Load previously saved webOS pairing credentials
-    store = load_store()
+    while time.time() < deadline:
+        client = None
 
-    # Connect to the TV.
-    # LG C3/webOS uses the secure WebSocket interface.
-    print("Creating webOS client...")
-    client = WebOSClient(TV_IP, secure=True)
+        try:
+            print(f"Connecting to webOS (attempt {attempt})...")
 
-    print("Connecting...")
-    client.connect()
-    print("Connected socket.")
+            client = WebOSClient(TV_IP, secure=True)
+            client.connect()
+
+            print("WebSocket connected. Registering...")
+
+            registered = False
+
+            for status in client.register(
+                store,
+                timeout=register_timeout,
+            ):
+                if status == WebOSClient.PROMPTED:
+                    print("Accept the connection prompt on the TV.")
+
+                elif status == WebOSClient.REGISTERED:
+                    print("Registered with TV.")
+                    registered = True
+                    break
+
+            if registered:
+                return client
+
+            raise RuntimeError(
+                "Registration ended without reaching REGISTERED state."
+            )
+
+        except Exception as e:
+            last_error = e
+            print(f"webOS not ready yet: {e}")
+
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+            remaining = deadline - time.time()
+
+            if remaining <= 0:
+                break
+
+            time.sleep(min(retry_delay, remaining))
+            attempt += 1
+
+    raise RuntimeError(
+        f"Could not establish a usable webOS session within "
+        f"{timeout} seconds. Last error: {last_error}"
+    )
 
 
-    print("Registering...")
-    for status in client.register(store):
-        print(f"Registration status: {status}")
-
-        if status == WebOSClient.PROMPTED:
-            print("Accept the connection prompt on the TV.")
-
-        elif status == WebOSClient.REGISTERED:
-            print("Registered with TV.")
-
-    print("Registration complete.")
-
-    # Save the client key so we don't need to pair every time.
-    save_store(store)
-
+def switch_to_input(client, target_input):
     source_control = SourceControl(client)
-
-    # Ask the TV what inputs actually exist.
     sources = source_control.list_sources()
 
     print("Available inputs:")
 
     for source in sources:
-        print(
-                f"  {source.data['id']} "
-                f"({source.data.get('label', '')})"
-                )
+        source_id = source.data.get("id")
+        label = source.data.get("label", "")
+        print(f"  {source_id} ({label})")
 
-    # Find HDMI 4.
     target = next(
-            (
-                source
-                for source in sources
-                if source.data.get("id") == TARGET_INPUT
-                ),
-            None,
-            )
+        (
+            source
+            for source in sources
+            if source.data.get("id") == target_input
+        ),
+        None,
+    )
 
     if target is None:
         raise RuntimeError(
-                f"{TARGET_INPUT} wasn't found in the TV's source list."
-                )
+            f"{target_input} wasn't found in the TV's source list."
+        )
 
-    print(f"Switching to {TARGET_INPUT}...")
+    print(f"Switching to {target_input}...")
     source_control.set_source(target)
 
     print("Done.")
+
+
+def main():
+    print(f"Waking TV at {TV_MAC}...")
+    wake(TV_MAC)
+
+    if not wait_for_tv(TV_IP):
+        raise RuntimeError(
+            f"TV did not become reachable within "
+            f"{TV_REACHABLE_TIMEOUT} seconds."
+        )
+
+    store = load_store()
+
+    client = connect_webos(store)
+
+    try:
+        # Registration can update the client key in the store.
+        save_store(store)
+
+        switch_to_input(client, TARGET_INPUT)
+
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
