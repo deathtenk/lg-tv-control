@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t lg-tv-control-builder .
+
+      - name: Extract binary
+        run: |
+          docker create \
+            --name lg-tv-build \
+            lg-tv-control-builder
+
+          docker cp \
+            lg-tv-build:/app/dist/lg-tv-control \
+            ./lg-tv-control-linux-x86_64
+
+          docker rm lg-tv-build
+
+      - name: Generate checksum
+        run: |
+          sha256sum lg-tv-control-linux-x86_64 \
+            > lg-tv-control-linux-x86_64.sha256
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            lg-tv-control-linux-x86_64 \
+            lg-tv-control-linux-x86_64.sha256 \
+            --generate-notes \
+            --title "${{ github.ref_name }}"
