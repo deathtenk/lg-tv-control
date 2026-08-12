@@ -1,0 +1,18 @@
+[Unit]
+Description=Wake LG TV and switch input after resume
+After=suspend.target
+
+[Service]
+Type=oneshot
+User=deck
+EnvironmentFile=/home/deck/.config/lg-tv-control/env
+
+ExecStartPre=/usr/bin/bash -c 'for i in {1..15}; do /usr/bin/ip route get "$TV_IP" 2>/dev/null | /usr/bin/grep -q "src " && exit 0; sleep 1; done; exit 1'
+
+ExecStart=/home/deck/.local/bin/lg-tv-control
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=suspend.target
