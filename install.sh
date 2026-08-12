@@ -5,6 +5,7 @@ REPO="deathtenk/lg-tv-control"
 INSTALL_DIR="$HOME/.local/bin"
 BINARY_NAME="lg-tv-control"
 ASSET_NAME="lg-tv-control-linux-x86_64"
+SERVICE_DIRECTORY_PATH="/etc/systemd/system"
 
 mkdir -p "$INSTALL_DIR"
 
@@ -37,3 +38,10 @@ install -m 0755 \
 echo
 echo "Installed:"
 echo "  $INSTALL_DIR/$BINARY_NAME"
+
+echo "Installing service..."
+cp -r ./lg-tv-control-resume.service "$SERVICE_DIRECTORY_PATH"
+
+sudo systemctl daemon-reload
+sudo systemctl enable lg-tv-control-resume.service
+echo "lg-tv-control-resume service installed."
