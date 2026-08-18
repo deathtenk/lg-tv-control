@@ -28,6 +28,7 @@ DEFAULT_DEBUG_MAX_REPORTS = 0
 DEFAULT_MATCH_STREAK = 2
 DEFAULT_RELEASE_STREAK = 3
 DEFAULT_TRACE_LIMIT = 200
+DEFAULT_TRACE_WINDOW_ONLY = True
 
 
 def configure_stdio():
@@ -244,6 +245,10 @@ def load_button_config():
         "BUTTON_TRACE_LIMIT",
         DEFAULT_TRACE_LIMIT,
     )
+    trace_window_only = read_env_bool(
+        "BUTTON_TRACE_WINDOW_ONLY",
+        DEFAULT_TRACE_WINDOW_ONLY,
+    )
 
     if mask_hex:
         mask = parse_hex_bytes(mask_hex)
@@ -267,6 +272,7 @@ def load_button_config():
         "release_streak": release_streak,
         "trace_matches": trace_matches,
         "trace_limit": trace_limit,
+        "trace_window_only": trace_window_only,
     }
 
 
@@ -284,6 +290,7 @@ def log_button_config(config, target_input=None, mode="listen"):
         f"release_streak={config['release_streak']} "
         f"trace_matches={config['trace_matches']} "
         f"trace_limit={config['trace_limit']} "
+        f"trace_window_only={config['trace_window_only']} "
         f"debounce_seconds={config['debounce_seconds']}"
     )
 
@@ -597,6 +604,7 @@ def listen_for_hid_button(target_input):
     release_streak = config["release_streak"]
     trace_matches = config["trace_matches"]
     trace_limit = config["trace_limit"]
+    trace_window_only = config["trace_window_only"]
 
     log_button_config(config, target_input=target_input, mode="listen")
 
@@ -634,13 +642,20 @@ def listen_for_hid_button(target_input):
                 trace_window = format_match_window(report, offset, len(match))
 
                 if trace_matches and traces_emitted < trace_limit:
-                    trace_state = (
-                        report,
-                        matched,
-                        button_is_down,
-                        consecutive_matches,
-                        consecutive_non_matches,
-                    )
+                    if trace_window_only:
+                        trace_state = (
+                            trace_window,
+                            matched,
+                            button_is_down,
+                        )
+                    else:
+                        trace_state = (
+                            report,
+                            matched,
+                            button_is_down,
+                            consecutive_matches,
+                            consecutive_non_matches,
+                        )
                     if previous_trace_by_fd.get(key.fd) != trace_state:
                         print(
                             "Listener report: "
