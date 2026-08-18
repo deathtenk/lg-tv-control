@@ -27,6 +27,7 @@ DEFAULT_HID_REPORT_SIZE = 64
 DEFAULT_DEBUG_MAX_REPORTS = 0
 DEFAULT_MATCH_STREAK = 2
 DEFAULT_RELEASE_STREAK = 3
+DEFAULT_TRACE_LIMIT = 200
 
 
 def configure_stdio():
@@ -80,6 +81,20 @@ def read_env_int(name, default):
         return default
 
     return int(value)
+
+
+def read_env_bool(name, default=False):
+    value = os.environ.get(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def build_default_match_mask(match):
@@ -224,6 +239,11 @@ def load_button_config():
         "BUTTON_RELEASE_STREAK",
         DEFAULT_RELEASE_STREAK,
     )
+    trace_matches = read_env_bool("BUTTON_TRACE_MATCHES", False)
+    trace_limit = read_env_int(
+        "BUTTON_TRACE_LIMIT",
+        DEFAULT_TRACE_LIMIT,
+    )
 
     if mask_hex:
         mask = parse_hex_bytes(mask_hex)
@@ -245,6 +265,8 @@ def load_button_config():
         "report_size": report_size,
         "match_streak": match_streak,
         "release_streak": release_streak,
+        "trace_matches": trace_matches,
+        "trace_limit": trace_limit,
     }
 
 
@@ -260,6 +282,8 @@ def log_button_config(config, target_input=None, mode="listen"):
         f"match_mask={config['mask'].hex()} "
         f"match_streak={config['match_streak']} "
         f"release_streak={config['release_streak']} "
+        f"trace_matches={config['trace_matches']} "
+        f"trace_limit={config['trace_limit']} "
         f"debounce_seconds={config['debounce_seconds']}"
     )
 
@@ -571,6 +595,8 @@ def listen_for_hid_button(target_input):
     report_size = config["report_size"]
     match_streak = config["match_streak"]
     release_streak = config["release_streak"]
+    trace_matches = config["trace_matches"]
+    trace_limit = config["trace_limit"]
 
     log_button_config(config, target_input=target_input, mode="listen")
 
@@ -582,6 +608,8 @@ def listen_for_hid_button(target_input):
     button_is_down_by_fd = {}
     consecutive_matches_by_fd = {}
     consecutive_non_matches_by_fd = {}
+    previous_trace_by_fd = {}
+    traces_emitted = 0
 
     try:
         while True:
@@ -603,11 +631,43 @@ def listen_for_hid_button(target_input):
                     key.fd,
                     0,
                 )
+                trace_window = format_match_window(report, offset, len(match))
+
+                if trace_matches and traces_emitted < trace_limit:
+                    trace_state = (
+                        report,
+                        matched,
+                        button_is_down,
+                        consecutive_matches,
+                        consecutive_non_matches,
+                    )
+                    if previous_trace_by_fd.get(key.fd) != trace_state:
+                        print(
+                            "Listener report: "
+                            f"device={key.data['devnode']} "
+                            f"matched={matched} "
+                            f"button_is_down={button_is_down} "
+                            f"match_streak_count={consecutive_matches} "
+                            f"release_streak_count={consecutive_non_matches} "
+                            f"window={trace_window} "
+                            f"report={report.hex()}"
+                        )
+                        previous_trace_by_fd[key.fd] = trace_state
+                        traces_emitted += 1
 
                 if matched and not button_is_down:
                     consecutive_matches += 1
                     consecutive_matches_by_fd[key.fd] = consecutive_matches
                     consecutive_non_matches_by_fd[key.fd] = 0
+
+                    if trace_matches and traces_emitted < trace_limit:
+                        print(
+                            "Listener match streak advanced: "
+                            f"device={key.data['devnode']} "
+                            f"count={consecutive_matches}/{match_streak} "
+                            f"window={trace_window}"
+                        )
+                        traces_emitted += 1
 
                     if consecutive_matches < match_streak:
                         continue
@@ -621,8 +681,23 @@ def listen_for_hid_button(target_input):
                         )
                         run_tv_action(target_input)
                         last_trigger_at = now
+                    elif trace_matches and traces_emitted < trace_limit:
+                        print(
+                            "Listener match suppressed by debounce: "
+                            f"device={key.data['devnode']} "
+                            f"window={trace_window}"
+                        )
+                        traces_emitted += 1
 
                     button_is_down_by_fd[key.fd] = True
+
+                    if trace_matches and traces_emitted < trace_limit:
+                        print(
+                            "Listener button latched down: "
+                            f"device={key.data['devnode']} "
+                            f"window={trace_window}"
+                        )
+                        traces_emitted += 1
 
                 elif not matched:
                     consecutive_matches_by_fd[key.fd] = 0
@@ -633,6 +708,14 @@ def listen_for_hid_button(target_input):
 
                     if button_is_down and consecutive_non_matches >= release_streak:
                         button_is_down_by_fd[key.fd] = False
+                        if trace_matches and traces_emitted < trace_limit:
+                            print(
+                                "Listener button released: "
+                                f"device={key.data['devnode']} "
+                                f"count={consecutive_non_matches}/{release_streak} "
+                                f"window={trace_window}"
+                            )
+                            traces_emitted += 1
 
                 else:
                     consecutive_non_matches_by_fd[key.fd] = 0
