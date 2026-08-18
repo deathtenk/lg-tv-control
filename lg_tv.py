@@ -617,7 +617,11 @@ def main():
         debug_hid_button(args.max_reports)
         return 0
 
-    target_input = args.target_input
+    target_input = getattr(
+        args,
+        "target_input",
+        os.environ.get("TARGET_INPUT"),
+    )
 
     if not target_input:
         raise RuntimeError(
