@@ -1,11 +1,11 @@
 [Unit]
-Description=Debug Steam button HID reports for LG TV control
+Description=Debug Steam button BTN_MODE events for LG TV control
 
 [Service]
 Type=simple
 User=deck
 EnvironmentFile=/home/deck/.config/lg-tv-control/env
-ExecStart=/home/deck/.local/bin/lg-tv-control debug-hid-button
+ExecStart=/home/deck/.local/bin/lg-tv-control debug-evdev-button
 Restart=no
 
 [Install]

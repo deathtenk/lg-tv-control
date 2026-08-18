@@ -7,6 +7,7 @@ import json
 import os
 import selectors
 import socket
+import struct
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,22 @@ DEFAULT_MATCH_STREAK = 2
 DEFAULT_RELEASE_STREAK = 3
 DEFAULT_TRACE_LIMIT = 200
 DEFAULT_TRACE_WINDOW_ONLY = True
+EV_KEY = 0x01
+BTN_MODE = 0x13C
+BUTTON_EVENT_NAMES = {
+    BTN_MODE: "BTN_MODE",
+}
+INPUT_EVENT_STRUCT = struct.Struct("llHHi")
+INPUT_EVENT_SIZE = INPUT_EVENT_STRUCT.size
+_IOC_NRBITS = 8
+_IOC_TYPEBITS = 8
+_IOC_SIZEBITS = 14
+_IOC_DIRBITS = 2
+_IOC_NRSHIFT = 0
+_IOC_TYPESHIFT = _IOC_NRSHIFT + _IOC_NRBITS
+_IOC_SIZESHIFT = _IOC_TYPESHIFT + _IOC_TYPEBITS
+_IOC_DIRSHIFT = _IOC_SIZESHIFT + _IOC_SIZEBITS
+_IOC_READ = 2
 
 
 def configure_stdio():
@@ -141,6 +158,18 @@ def build_hid_id_candidates(value):
     return candidates
 
 
+def build_hid_id_candidates_from_product(value):
+    parts = [part.strip().lower() for part in value.split("/")]
+
+    if len(parts) < 3:
+        return set()
+
+    bus = int(parts[0], 16)
+    vendor = int(parts[1], 16)
+    product = int(parts[2], 16)
+    return build_hid_id_candidates(f"{bus:04x}:{vendor:04x}:{product:04x}")
+
+
 def read_sysfs_uevent(path):
     data = {}
 
@@ -155,12 +184,156 @@ def read_sysfs_uevent(path):
 
 
 def hid_id_candidates_from_uevent(uevent):
+    candidates = set()
     hid_id = uevent.get("HID_ID")
+    product = uevent.get("PRODUCT")
 
-    if not hid_id:
-        return set()
+    if hid_id:
+        candidates.update(build_hid_id_candidates(hid_id))
 
-    return build_hid_id_candidates(hid_id)
+    if product:
+        candidates.update(build_hid_id_candidates_from_product(product))
+
+    return candidates
+
+
+def _ioc(direction, type_, number, size):
+    return (
+        (direction << _IOC_DIRSHIFT)
+        | (type_ << _IOC_TYPESHIFT)
+        | (number << _IOC_NRSHIFT)
+        | (size << _IOC_SIZESHIFT)
+    )
+
+
+def eviocgname(length):
+    return _ioc(_IOC_READ, ord("E"), 0x06, length)
+
+
+def eviocgbit(event_type, length):
+    return _ioc(_IOC_READ, ord("E"), 0x20 + event_type, length)
+
+
+def test_bit(bitmap, bit):
+    byte_index = bit // 8
+
+    if byte_index >= len(bitmap):
+        return False
+
+    return (bitmap[byte_index] & (1 << (bit % 8))) != 0
+
+
+def get_input_device_name(fd, fallback=""):
+    buffer = bytearray(256)
+
+    try:
+        fcntl.ioctl(fd, eviocgname(len(buffer)), buffer, True)
+    except OSError:
+        return fallback
+
+    return buffer.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+
+def supports_key_code(fd, key_code):
+    bitmap = bytearray((key_code // 8) + 1)
+
+    try:
+        fcntl.ioctl(fd, eviocgbit(EV_KEY, len(bitmap)), bitmap, True)
+    except OSError:
+        return False
+
+    return test_bit(bitmap, key_code)
+
+
+def parse_button_event_code(value):
+    normalized = value.strip().upper()
+
+    if normalized == "BTN_MODE":
+        return BTN_MODE
+
+    return int(value, 0)
+
+
+def get_button_event_name(button_code):
+    return BUTTON_EVENT_NAMES.get(button_code, hex(button_code))
+
+
+def find_input_device_uevent(device_path):
+    for candidate in [device_path, *device_path.parents]:
+        uevent_path = candidate / "uevent"
+
+        if not uevent_path.exists():
+            continue
+
+        uevent = read_sysfs_uevent(uevent_path)
+
+        if hid_id_candidates_from_uevent(uevent):
+            return uevent
+
+    return {}
+
+
+def resolve_button_event_devices(button_code):
+    explicit_device = os.environ.get("BUTTON_EVENT_DEVICE")
+
+    if explicit_device:
+        return [{"devnode": explicit_device, "name": ""}]
+
+    button_device_id = require_env("BUTTON_DEVICE_ID")
+    target_candidates = build_hid_id_candidates(button_device_id)
+    matches = []
+
+    for event_path in sorted(Path("/sys/class/input").glob("event*")):
+        device_path = event_path / "device"
+        uevent = find_input_device_uevent(device_path)
+        current_candidates = hid_id_candidates_from_uevent(uevent)
+
+        if not target_candidates.intersection(current_candidates):
+            continue
+
+        devnode = f"/dev/input/{event_path.name}"
+
+        try:
+            fd = os.open(devnode, os.O_RDONLY)
+        except OSError:
+            continue
+
+        try:
+            if not supports_key_code(fd, button_code):
+                continue
+
+            matches.append(
+                {
+                    "devnode": devnode,
+                    "name": get_input_device_name(fd, fallback=""),
+                }
+            )
+        finally:
+            os.close(fd)
+
+    if not matches:
+        raise RuntimeError(
+            f"Could not find an event device for BUTTON_DEVICE_ID="
+            f"{button_device_id} exposing {get_button_event_name(button_code)}."
+        )
+
+    if len(matches) > 1:
+        match_list = ", ".join(
+            f"{match['devnode']} ({match['name']})"
+            for match in matches
+        )
+        print(
+            f"BUTTON_DEVICE_ID={button_device_id} matched multiple "
+            f"event devices. Listening on all of them: {match_list}"
+        )
+    else:
+        match = matches[0]
+        print(
+            f"Resolved BUTTON_DEVICE_ID={button_device_id} to "
+            f"{match['devnode']} ({match['name']})"
+        )
+
+    return matches
 
 
 def resolve_button_devices():
@@ -276,6 +449,31 @@ def load_button_config():
     }
 
 
+def load_button_event_config():
+    button_code = parse_button_event_code(
+        os.environ.get("BUTTON_EVENT_CODE", "BTN_MODE")
+    )
+    devices = resolve_button_event_devices(button_code)
+    debounce_seconds = read_env_float(
+        "BUTTON_DEBOUNCE_SECONDS",
+        DEFAULT_DEBOUNCE_SECONDS,
+    )
+    trace_matches = read_env_bool("BUTTON_TRACE_MATCHES", False)
+    trace_limit = read_env_int(
+        "BUTTON_TRACE_LIMIT",
+        DEFAULT_TRACE_LIMIT,
+    )
+
+    return {
+        "devices": devices,
+        "button_code": button_code,
+        "button_name": get_button_event_name(button_code),
+        "debounce_seconds": debounce_seconds,
+        "trace_matches": trace_matches,
+        "trace_limit": trace_limit,
+    }
+
+
 def log_button_config(config, target_input=None, mode="listen"):
     device_list = ", ".join(device["devnode"] for device in config["devices"])
     print(
@@ -291,6 +489,22 @@ def log_button_config(config, target_input=None, mode="listen"):
         f"trace_matches={config['trace_matches']} "
         f"trace_limit={config['trace_limit']} "
         f"trace_window_only={config['trace_window_only']} "
+        f"debounce_seconds={config['debounce_seconds']}"
+    )
+
+    if target_input is not None:
+        print(f"Loaded target input: {target_input}")
+
+
+def log_button_event_config(config, target_input=None, mode="listen"):
+    device_list = ", ".join(device["devnode"] for device in config["devices"])
+    print(
+        "Loaded button event config: "
+        f"mode={mode} "
+        f"devices={device_list} "
+        f"button_code={config['button_name']}({hex(config['button_code'])}) "
+        f"trace_matches={config['trace_matches']} "
+        f"trace_limit={config['trace_limit']} "
         f"debounce_seconds={config['debounce_seconds']}"
     )
 
@@ -592,6 +806,169 @@ def close_hid_devices(selector, handles):
             pass
 
 
+def open_event_devices(devices):
+    selector = selectors.DefaultSelector()
+    handles = []
+
+    for device in devices:
+        fd = os.open(device["devnode"], os.O_RDONLY)
+        selector.register(fd, selectors.EVENT_READ, data=device)
+        handles.append(fd)
+
+    return selector, handles
+
+
+def close_event_devices(selector, handles):
+    close_hid_devices(selector, handles)
+
+
+def read_input_event(fd):
+    data = os.read(fd, INPUT_EVENT_SIZE)
+
+    if len(data) != INPUT_EVENT_SIZE:
+        return None
+
+    return INPUT_EVENT_STRUCT.unpack(data)
+
+
+def describe_button_event_value(value):
+    if value == 1:
+        return "press"
+
+    if value == 0:
+        return "release"
+
+    if value == 2:
+        return "repeat"
+
+    return str(value)
+
+
+def listen_for_evdev_button(target_input):
+    config = load_button_event_config()
+    devices = config["devices"]
+    button_code = config["button_code"]
+    debounce_seconds = config["debounce_seconds"]
+    trace_matches = config["trace_matches"]
+    trace_limit = config["trace_limit"]
+
+    log_button_event_config(config, target_input=target_input, mode="listen")
+
+    device_list = ", ".join(device["devnode"] for device in devices)
+    print(
+        "Listening for button events on "
+        f"{device_list} ({config['button_name']})..."
+    )
+
+    selector, handles = open_event_devices(devices)
+    last_trigger_at = 0.0
+    button_is_down_by_fd = {}
+    traces_emitted = 0
+
+    try:
+        while True:
+            events = selector.select(timeout=0.5)
+
+            if not events:
+                continue
+
+            for key, _ in events:
+                input_event = read_input_event(key.fd)
+
+                if input_event is None:
+                    continue
+
+                _, _, event_type, event_code, event_value = input_event
+
+                if event_type != EV_KEY or event_code != button_code:
+                    continue
+
+                button_is_down = button_is_down_by_fd.get(key.fd, False)
+
+                if trace_matches and traces_emitted < trace_limit:
+                    print(
+                        "Listener button event: "
+                        f"device={key.data['devnode']} "
+                        f"code={config['button_name']} "
+                        f"value={describe_button_event_value(event_value)} "
+                        f"button_is_down={button_is_down}"
+                    )
+                    traces_emitted += 1
+
+                if event_value == 1 and not button_is_down:
+                    now = time.time()
+
+                    if now - last_trigger_at >= debounce_seconds:
+                        print(
+                            "Matched button press on "
+                            f"{key.data['devnode']}. Triggering TV action."
+                        )
+                        run_tv_action(target_input)
+                        last_trigger_at = now
+                    elif trace_matches and traces_emitted < trace_limit:
+                        print(
+                            "Listener match suppressed by debounce: "
+                            f"device={key.data['devnode']}"
+                        )
+                        traces_emitted += 1
+
+                    button_is_down_by_fd[key.fd] = True
+
+                elif event_value == 0:
+                    button_is_down_by_fd[key.fd] = False
+
+    finally:
+        close_event_devices(selector, handles)
+
+
+def debug_evdev_button(max_reports):
+    config = load_button_event_config()
+    devices = config["devices"]
+    button_code = config["button_code"]
+    device_list = ", ".join(device["devnode"] for device in devices)
+
+    log_button_event_config(config, mode="debug")
+    print(
+        "Debugging button events on "
+        f"{device_list} ({config['button_name']})..."
+    )
+
+    selector, handles = open_event_devices(devices)
+    seen = 0
+
+    try:
+        while max_reports <= 0 or seen < max_reports:
+            events = selector.select(timeout=0.5)
+
+            if not events:
+                continue
+
+            for key, _ in events:
+                input_event = read_input_event(key.fd)
+
+                if input_event is None:
+                    continue
+
+                _, _, event_type, event_code, event_value = input_event
+
+                if event_type != EV_KEY or event_code != button_code:
+                    continue
+
+                print(
+                    "button-event "
+                    f"device={key.data['devnode']} "
+                    f"code={config['button_name']} "
+                    f"value={describe_button_event_value(event_value)}"
+                )
+                seen += 1
+
+                if max_reports > 0 and seen >= max_reports:
+                    break
+
+    finally:
+        close_event_devices(selector, handles)
+
+
 def listen_for_hid_button(target_input):
     config = load_button_config()
     devices = config["devices"]
@@ -807,24 +1184,40 @@ def parse_args():
         help="TV input ID to switch to after wake.",
     )
 
-    listen_parser = subparsers.add_parser("listen-hid-button")
-    listen_parser.add_argument(
+    for command_name in ("listen-evdev-button", "listen-hid-button"):
+        listen_parser = subparsers.add_parser(
+            command_name,
+            help=(
+                argparse.SUPPRESS
+                if command_name == "listen-hid-button"
+                else None
+            ),
+        )
+        listen_parser.add_argument(
         "--input",
         dest="target_input",
         default=os.environ.get("TARGET_INPUT"),
-        help="TV input ID to switch to after a matched HID report.",
-    )
+        help="TV input ID to switch to after a matched button event.",
+        )
 
-    debug_parser = subparsers.add_parser("debug-hid-button")
-    debug_parser.add_argument(
-        "--max-reports",
-        type=int,
-        default=read_env_int(
-            "BUTTON_DEBUG_MAX_REPORTS",
-            DEFAULT_DEBUG_MAX_REPORTS,
-        ),
-        help="Stop after printing this many changed reports. 0 means no limit.",
-    )
+    for command_name in ("debug-evdev-button", "debug-hid-button"):
+        debug_parser = subparsers.add_parser(
+            command_name,
+            help=(
+                argparse.SUPPRESS
+                if command_name == "debug-hid-button"
+                else None
+            ),
+        )
+        debug_parser.add_argument(
+            "--max-reports",
+            type=int,
+            default=read_env_int(
+                "BUTTON_DEBUG_MAX_REPORTS",
+                DEFAULT_DEBUG_MAX_REPORTS,
+            ),
+            help="Stop after printing this many button events. 0 means no limit.",
+        )
 
     return parser.parse_args()
 
@@ -835,8 +1228,13 @@ def main():
     args = parse_args()
     command = args.command or "run"
 
-    if command == "debug-hid-button":
-        debug_hid_button(args.max_reports)
+    if command in {"debug-evdev-button", "debug-hid-button"}:
+        if command == "debug-hid-button":
+            print(
+                "debug-hid-button is deprecated. "
+                "Using documented evdev BTN_MODE events instead."
+            )
+        debug_evdev_button(args.max_reports)
         return 0
 
     target_input = getattr(
@@ -850,8 +1248,13 @@ def main():
             "A target input is required via --input or TARGET_INPUT."
         )
 
-    if command == "listen-hid-button":
-        listen_for_hid_button(target_input)
+    if command in {"listen-evdev-button", "listen-hid-button"}:
+        if command == "listen-hid-button":
+            print(
+                "listen-hid-button is deprecated. "
+                "Using documented evdev BTN_MODE events instead."
+            )
+        listen_for_evdev_button(target_input)
         return 0
 
     return run_tv_action(target_input)

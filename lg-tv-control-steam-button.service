@@ -8,7 +8,7 @@ Type=simple
 User=deck
 EnvironmentFile=/home/deck/.config/lg-tv-control/env
 Environment=PAIRING_FILE=/home/deck/.lg_webos_key.json
-ExecStart=/home/deck/.local/bin/lg-tv-control listen-hid-button --input HDMI_4
+ExecStart=/home/deck/.local/bin/lg-tv-control listen-evdev-button --input HDMI_4
 Restart=always
 RestartSec=2
 
