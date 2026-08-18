@@ -1,0 +1,12 @@
+[Unit]
+Description=Debug Steam button raw HID reports for LG TV control
+
+[Service]
+Type=simple
+User=deck
+EnvironmentFile=/home/deck/.config/lg-tv-control/env
+ExecStart=/home/deck/.local/bin/lg-tv-control debug-hid-button
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

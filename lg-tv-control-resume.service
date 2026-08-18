@@ -11,8 +11,5 @@ ExecStartPre=/usr/bin/bash -c 'for i in {1..15}; do /usr/bin/ip route get "$TV_I
 
 ExecStart=/home/deck/.local/bin/lg-tv-control
 
-Restart=on-failure
-RestartSec=2
-
 [Install]
 WantedBy=suspend.target

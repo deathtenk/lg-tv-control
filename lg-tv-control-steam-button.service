@@ -1,0 +1,16 @@
+[Unit]
+Description=Listen for Steam button and switch LG TV to HDMI4
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deck
+EnvironmentFile=/home/deck/.config/lg-tv-control/env
+Environment=PAIRING_FILE=/home/deck/.lg_webos_key.json
+ExecStart=/home/deck/.local/bin/lg-tv-control listen-hid-button --input HDMI_4
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,13 +1,97 @@
 #!/usr/bin/env python3
 
+import argparse
+import binascii
+import fcntl
 import json
 import os
+import selectors
 import socket
+import sys
 import time
+from pathlib import Path
 
 from wakeonlan import wake
 from pywebostv.connection import WebOSClient
-from pywebostv.controls import SourceControl
+from pywebostv.controls import ApplicationControl, SourceControl
+
+
+TV_REACHABLE_TIMEOUT = 20
+WEBOS_CONNECT_TIMEOUT = 30
+WEBOS_RETRY_DELAY = 2
+TV_PROBE_TIMEOUT = 2
+WEBOS_PROBE_TIMEOUT = 5
+DEFAULT_DEBOUNCE_SECONDS = 3.0
+DEFAULT_LOCK_FILE = "/tmp/lg-tv-control.lock"
+DEFAULT_HID_REPORT_SIZE = 64
+DEFAULT_DEBUG_MAX_REPORTS = 0
+DEFAULT_MATCH_STREAK = 2
+DEFAULT_RELEASE_STREAK = 3
+DEFAULT_TRACE_LIMIT = 200
+DEFAULT_TRACE_WINDOW_ONLY = True
+STEAM_CONTROLLER_2026_REPORT_SIZE = 54
+STEAM_CONTROLLER_2026_REPORT_ID = 0x42
+STEAM_CONTROLLER_2026_BUTTON_BITS = {
+    "A": (2, 0),
+    "B": (2, 1),
+    "X": (2, 2),
+    "Y": (2, 3),
+    "R5": (3, 0),
+    "R1": (3, 1),
+    "L4": (4, 1),
+    "L5": (4, 2),
+    "L1": (4, 3),
+    "R4": (2, 7),
+}
+STEAM_DECK_BUTTON_BITS = {
+    "R2": (8, 0),
+    "L2": (8, 1),
+    "R1": (8, 2),
+    "L1": (8, 3),
+    "Y": (8, 4),
+    "B": (8, 5),
+    "X": (8, 6),
+    "A": (8, 7),
+    "L5": (9, 7),
+    "R5": (10, 0),
+    "L4": (13, 1),
+    "R4": (13, 2),
+}
+STEAM_DECK_TRIGGER_OFFSETS = {
+    "L2": 44,
+    "R2": 46,
+}
+STEAM_DECK_TRIGGER_THRESHOLD = 16384
+STEAM_DECK_REPORT_SIZE = 64
+STEAM_DECK_REPORT_TYPE = 9
+STEAM_CONTROLLER_REPORT_TYPE = 1
+STEAM_CONTROLLER_BUTTON_BITS = {
+    name: location
+    for name, location in STEAM_DECK_BUTTON_BITS.items()
+    if name not in ("L4", "R4")
+}
+STEAM_CONTROLLER_TRIGGER_OFFSETS = {
+    "L2": 11,
+    "R2": 12,
+}
+STEAM_CONTROLLER_TRIGGER_THRESHOLD = 128
+STEAM_HID_INTERFACES = {
+    "0003:000028DE:00001205": ("/input2",),
+    "0003:000028DE:00001102": ("/input2",),
+    "0003:000028DE:00001142": ("/input1", "/input2"),
+    "0003:000028DE:00001304": ("/input2",),
+}
+BUTTON_NAME_STEAM = "STEAM"
+DEFAULT_STEAM_PRESS_REPORT = "440402000000"
+DEFAULT_STEAM_RELEASE_REPORT = "440302000000"
+
+
+def configure_stdio():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
 
 
 def require_env(name):
@@ -21,27 +105,308 @@ def require_env(name):
     return value
 
 
-TV_IP = require_env("TV_IP")
-TV_MAC = require_env("TV_MAC")
-TARGET_INPUT = require_env("TARGET_INPUT")
+def get_pairing_file():
+    return os.environ.get(
+        "PAIRING_FILE",
+        os.path.expanduser("~/.lg_webos_key.json"),
+    )
 
-PAIRING_FILE = os.path.expanduser("~/.lg_webos_key.json")
 
-TV_REACHABLE_TIMEOUT = 20
-WEBOS_CONNECT_TIMEOUT = 30
-WEBOS_RETRY_DELAY = 2
+def parse_hex_bytes(value):
+    normalized = "".join(value.split())
+
+    if len(normalized) % 2 != 0:
+        raise ValueError("Hex strings must contain an even number of digits.")
+
+    return binascii.unhexlify(normalized)
+
+
+def read_env_float(name, default):
+    value = os.environ.get(name)
+
+    if value is None:
+        return default
+
+    return float(value)
+
+
+def read_env_int(name, default):
+    value = os.environ.get(name)
+
+    if value is None:
+        return default
+
+    return int(value)
+
+
+def read_env_bool(name, default=False):
+    value = os.environ.get(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def build_default_match_mask(match):
+    mask = bytes(0xFF if byte != 0 else 0x00 for byte in match)
+
+    if any(mask):
+        return mask
+
+    return b"\xff" * len(match)
+
+
+def parse_hid_id(value):
+    parts = [part.strip().lower() for part in value.split(":")]
+
+    if len(parts) == 3:
+        bus, vendor, product = parts
+        return (
+            int(bus, 16),
+            int(vendor, 16),
+            int(product, 16),
+        )
+
+    if len(parts) == 2:
+        vendor, product = parts
+        return (None, int(vendor, 16), int(product, 16))
+
+    raise ValueError(
+        "HID device IDs must be BUS:VENDOR:PRODUCT or VENDOR:PRODUCT."
+    )
+
+
+def build_hid_id_candidates(value):
+    bus, vendor, product = parse_hid_id(value)
+    candidates = {
+        f"{vendor:04x}:{product:04x}",
+        f"{vendor:08x}:{product:08x}",
+    }
+
+    if bus is not None:
+        candidates.add(f"{bus:04x}:{vendor:04x}:{product:04x}")
+        candidates.add(f"{bus:04x}:{vendor:08x}:{product:08x}")
+
+    return candidates
+
+
+def read_sysfs_uevent(path):
+    data = {}
+
+    for line in path.read_text().splitlines():
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        data[key] = value
+
+    return data
+
+
+def hid_id_candidates_from_uevent(uevent):
+    hid_id = uevent.get("HID_ID")
+    if not hid_id:
+        return set()
+
+    return build_hid_id_candidates(hid_id)
+
+
+def resolve_button_devices():
+    explicit_device = os.environ.get("BUTTON_DEVICE")
+
+    if explicit_device:
+        return [{"devnode": explicit_device, "hid_id": "", "name": ""}]
+
+    button_device_id = require_env("BUTTON_DEVICE_ID")
+    target_candidates = build_hid_id_candidates(button_device_id)
+    matches = []
+
+    for hidraw_path in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        uevent_path = hidraw_path / "device" / "uevent"
+
+        if not uevent_path.exists():
+            continue
+
+        uevent = read_sysfs_uevent(uevent_path)
+        current_candidates = hid_id_candidates_from_uevent(uevent)
+
+        if not target_candidates.intersection(current_candidates):
+            continue
+
+        hid_phys = uevent.get("HID_PHYS", "")
+        allowed_suffixes = STEAM_HID_INTERFACES.get(uevent.get("HID_ID", ""), ())
+
+        if allowed_suffixes and not hid_phys.endswith(allowed_suffixes):
+            continue
+
+        devnode = f"/dev/{hidraw_path.name}"
+        matches.append(
+            {
+                "devnode": devnode,
+                "hid_id": uevent.get("HID_ID", ""),
+                "name": uevent.get("HID_NAME", ""),
+                "hid_phys": hid_phys,
+            }
+        )
+
+    if not matches:
+        raise RuntimeError(
+            f"Could not find a hidraw device for BUTTON_DEVICE_ID="
+            f"{button_device_id}."
+        )
+
+    if len(matches) > 1:
+        match_list = ", ".join(
+            f"{match['devnode']} ({match['hid_id']} {match['name']} {match['hid_phys']})"
+            for match in matches
+        )
+        print(
+            f"BUTTON_DEVICE_ID={button_device_id} matched multiple "
+            f"hidraw devices. Listening on all of them: {match_list}"
+        )
+    else:
+        match = matches[0]
+        print(
+            f"Resolved BUTTON_DEVICE_ID={button_device_id} to "
+            f"{match['devnode']} ({match['hid_id']} {match['name']} {match['hid_phys']})"
+        )
+
+    return matches
+
+
+def load_button_config():
+    devices = resolve_button_devices()
+    button_name = os.environ.get("BUTTON_NAME", BUTTON_NAME_STEAM).strip().upper()
+    match_hex = os.environ.get("BUTTON_MATCH_HEX")
+    steam_press_report = parse_hex_bytes(
+        os.environ.get(
+            "BUTTON_STEAM_PRESS_HEX",
+            DEFAULT_STEAM_PRESS_REPORT,
+        )
+    )
+    steam_release_report = parse_hex_bytes(
+        os.environ.get(
+            "BUTTON_STEAM_RELEASE_HEX",
+            DEFAULT_STEAM_RELEASE_REPORT,
+        )
+    )
+    mask_hex = os.environ.get("BUTTON_MATCH_MASK_HEX")
+    offset = read_env_int("BUTTON_MATCH_OFFSET", 0)
+    debounce_seconds = read_env_float(
+        "BUTTON_DEBOUNCE_SECONDS",
+        DEFAULT_DEBOUNCE_SECONDS,
+    )
+    report_size = read_env_int(
+        "BUTTON_REPORT_SIZE",
+        DEFAULT_HID_REPORT_SIZE,
+    )
+    match_streak = read_env_int(
+        "BUTTON_MATCH_STREAK",
+        DEFAULT_MATCH_STREAK,
+    )
+    release_streak = read_env_int(
+        "BUTTON_RELEASE_STREAK",
+        DEFAULT_RELEASE_STREAK,
+    )
+    trace_matches = read_env_bool("BUTTON_TRACE_MATCHES", False)
+    trace_limit = read_env_int(
+        "BUTTON_TRACE_LIMIT",
+        DEFAULT_TRACE_LIMIT,
+    )
+    trace_window_only = read_env_bool(
+        "BUTTON_TRACE_WINDOW_ONLY",
+        DEFAULT_TRACE_WINDOW_ONLY,
+    )
+
+    if match_hex:
+        match = parse_hex_bytes(match_hex)
+    else:
+        match = b""
+
+    if not match:
+        mask = b""
+    elif mask_hex:
+        mask = parse_hex_bytes(mask_hex)
+    else:
+        mask = build_default_match_mask(match)
+
+    if match and len(mask) != len(match):
+        raise RuntimeError(
+            "BUTTON_MATCH_MASK_HEX must be the same length as "
+            "BUTTON_MATCH_HEX."
+        )
+
+    return {
+        "devices": devices,
+        "button_name": button_name,
+        "match": match,
+        "mask": mask,
+        "offset": offset,
+        "steam_press_report": steam_press_report,
+        "steam_release_report": steam_release_report,
+        "debounce_seconds": debounce_seconds,
+        "report_size": report_size,
+        "match_streak": match_streak,
+        "release_streak": release_streak,
+        "trace_matches": trace_matches,
+        "trace_limit": trace_limit,
+        "trace_window_only": trace_window_only,
+    }
+
+
+def log_button_config(config, target_input=None, mode="listen"):
+    device_list = ", ".join(device["devnode"] for device in config["devices"])
+    print(
+        "Loaded HID button config: "
+        f"mode={mode} "
+        f"devices={device_list} "
+        f"button_name={config['button_name']} "
+        f"report_size={config['report_size']} "
+        f"match_offset={config['offset']} "
+        f"steam_press_hex={config['steam_press_report'].hex()} "
+        f"steam_release_hex={config['steam_release_report'].hex()} "
+        f"match_streak={config['match_streak']} "
+        f"release_streak={config['release_streak']} "
+        f"trace_matches={config['trace_matches']} "
+        f"trace_limit={config['trace_limit']} "
+        f"trace_window_only={config['trace_window_only']} "
+        f"debounce_seconds={config['debounce_seconds']}"
+    )
+
+    if config["match"]:
+        print(
+            "Loaded fallback byte matcher: "
+            f"match_offset={config['offset']} "
+            f"match_hex={config['match'].hex()} "
+            f"match_mask={config['mask'].hex()}"
+        )
+
+    if target_input is not None:
+        print(f"Loaded target input: {target_input}")
 
 
 def load_store():
-    if os.path.exists(PAIRING_FILE):
-        with open(PAIRING_FILE, "r") as f:
+    pairing_file = get_pairing_file()
+
+    if os.path.exists(pairing_file):
+        with open(pairing_file, "r") as f:
             return json.load(f)
 
     return {}
 
 
 def save_store(store):
-    with open(PAIRING_FILE, "w") as f:
+    pairing_file = get_pairing_file()
+
+    os.makedirs(os.path.dirname(pairing_file), exist_ok=True)
+
+    with open(pairing_file, "w") as f:
         json.dump(store, f)
 
 
@@ -68,6 +433,7 @@ def wait_for_tv(host, port=3001, timeout=TV_REACHABLE_TIMEOUT):
 
 
 def connect_webos(
+    tv_ip,
     store,
     timeout=WEBOS_CONNECT_TIMEOUT,
     retry_delay=WEBOS_RETRY_DELAY,
@@ -89,7 +455,7 @@ def connect_webos(
         try:
             print(f"Connecting to webOS (attempt {attempt})...")
 
-            client = WebOSClient(TV_IP, secure=True)
+            client = WebOSClient(tv_ip, secure=True)
             client.connect()
 
             print("WebSocket connected. Registering...")
@@ -141,6 +507,7 @@ def connect_webos(
 
 def switch_to_input(client, target_input):
     source_control = SourceControl(client)
+    application_control = ApplicationControl(client)
     sources = source_control.list_sources()
 
     print("Available inputs:")
@@ -164,32 +531,49 @@ def switch_to_input(client, target_input):
             f"{target_input} wasn't found in the TV's source list."
         )
 
+    current_app_id = None
+
+    try:
+        current_app_id = application_control.get_current()
+        print(f"Current foreground app: {current_app_id}")
+    except Exception as e:
+        print(f"Could not determine current foreground app: {e}")
+
+    target_app_ids = set()
+
+    for key in ("appId", "launcherAppId"):
+        value = target.data.get(key)
+
+        if value:
+            target_app_ids.add(value)
+
+    normalized_target = target_input.lower().replace("_", "")
+
+    if normalized_target.startswith("hdmi"):
+        target_app_ids.add(f"com.webos.app.{normalized_target}")
+
+    if current_app_id and current_app_id in target_app_ids:
+        print(
+            f"TV is already on {target_input} "
+            f"({current_app_id}). Skipping input switch."
+        )
+        return False
+
     print(f"Switching to {target_input}...")
     source_control.set_source(target)
 
     print("Done.")
+    return True
 
 
-def main():
-    print(f"Waking TV at {TV_MAC}...")
-    wake(TV_MAC)
-
-    if not wait_for_tv(TV_IP):
-        raise RuntimeError(
-            f"TV did not become reachable within "
-            f"{TV_REACHABLE_TIMEOUT} seconds."
-        )
-
+def connect_and_ensure_input(tv_ip, target_input, timeout):
     store = load_store()
-
-    client = connect_webos(store)
+    client = connect_webos(tv_ip, store, timeout=timeout)
 
     try:
         # Registration can update the client key in the store.
         save_store(store)
-
-        switch_to_input(client, TARGET_INPUT)
-
+        switch_to_input(client, target_input)
     finally:
         try:
             client.close()
@@ -197,5 +581,453 @@ def main():
             pass
 
 
+def acquire_action_lock():
+    lock_file = os.environ.get("ACTION_LOCK_FILE", DEFAULT_LOCK_FILE)
+    lock_handle = open(lock_file, "w")
+
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_handle.close()
+        return None
+
+    return lock_handle
+
+
+def run_tv_action(target_input):
+    tv_ip = require_env("TV_IP")
+    tv_mac = require_env("TV_MAC")
+
+    lock_handle = acquire_action_lock()
+
+    if lock_handle is None:
+        print("Another lg-tv-control action is already running. Skipping.")
+        return 0
+
+    try:
+        if wait_for_tv(tv_ip, timeout=TV_PROBE_TIMEOUT):
+            print("TV is already reachable. Checking current input before waking.")
+
+            try:
+                connect_and_ensure_input(
+                    tv_ip,
+                    target_input,
+                    timeout=WEBOS_PROBE_TIMEOUT,
+                )
+                return 0
+            except Exception as e:
+                print(f"Reachability probe could not confirm state: {e}")
+                print("Falling back to Wake-on-LAN flow.")
+
+        print(f"Waking TV at {tv_mac}...")
+        wake(tv_mac)
+
+        if not wait_for_tv(tv_ip):
+            raise RuntimeError(
+                f"TV did not become reachable within "
+                f"{TV_REACHABLE_TIMEOUT} seconds."
+            )
+
+        connect_and_ensure_input(
+            tv_ip,
+            target_input,
+            timeout=WEBOS_CONNECT_TIMEOUT,
+        )
+
+        return 0
+
+    finally:
+        lock_handle.close()
+
+
+def report_matches(report, match, mask, offset):
+    end = offset + len(match)
+
+    if len(report) < end:
+        return False
+
+    window = report[offset:end]
+
+    for report_byte, match_byte, mask_byte in zip(window, match, mask):
+        if ((report_byte ^ match_byte) & mask_byte) != 0:
+            return False
+
+    return True
+
+
+def raw_button_states(report):
+    if (
+        len(report) == STEAM_CONTROLLER_2026_REPORT_SIZE
+        and report[0] == STEAM_CONTROLLER_2026_REPORT_ID
+    ):
+        return {
+            name: bool(report[byte] & (1 << bit))
+            for name, (byte, bit) in STEAM_CONTROLLER_2026_BUTTON_BITS.items()
+        }
+
+    if (
+        len(report) != STEAM_DECK_REPORT_SIZE
+        or report[0] != 1
+        or report[1] != 0
+    ):
+        return None
+
+    report_type = report[2]
+
+    if report_type == STEAM_DECK_REPORT_TYPE:
+        button_bits = STEAM_DECK_BUTTON_BITS
+        trigger_offsets = STEAM_DECK_TRIGGER_OFFSETS
+        trigger_threshold = STEAM_DECK_TRIGGER_THRESHOLD
+    elif report_type == STEAM_CONTROLLER_REPORT_TYPE:
+        button_bits = STEAM_CONTROLLER_BUTTON_BITS
+        trigger_offsets = STEAM_CONTROLLER_TRIGGER_OFFSETS
+        trigger_threshold = STEAM_CONTROLLER_TRIGGER_THRESHOLD
+    else:
+        return None
+
+    states = {
+        name: bool(report[byte] & (1 << bit))
+        for name, (byte, bit) in button_bits.items()
+    }
+
+    for name, offset in trigger_offsets.items():
+        if report_type == STEAM_DECK_REPORT_TYPE:
+            analog_value = int.from_bytes(report[offset:offset + 2], "little")
+        else:
+            analog_value = report[offset]
+        states[name] = states[name] or analog_value >= trigger_threshold
+
+    return states
+
+
+def report_button_pressed(report, config):
+    button_name = config["button_name"]
+
+    if button_name == BUTTON_NAME_STEAM:
+        if report == config["steam_press_report"]:
+            return True
+
+        if report == config["steam_release_report"]:
+            return False
+
+        if not config["match"]:
+            return None
+
+        return report_matches(
+            report,
+            config["match"],
+            config["mask"],
+            config["offset"],
+        )
+
+    states = raw_button_states(report)
+
+    if states is None:
+        return None
+
+    return states.get(button_name, False)
+
+
+def format_match_window(report, offset, length):
+    end = min(len(report), offset + length)
+    return report[offset:end].hex()
+
+
+def open_hid_devices(devices):
+    selector = selectors.DefaultSelector()
+    handles = []
+
+    for device in devices:
+        fd = os.open(device["devnode"], os.O_RDONLY)
+        selector.register(fd, selectors.EVENT_READ, data=device)
+        handles.append(fd)
+
+    return selector, handles
+
+
+def close_hid_devices(selector, handles):
+    for fd in handles:
+        try:
+            selector.unregister(fd)
+        except Exception:
+            pass
+
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def listen_for_hid_button(target_input):
+    config = load_button_config()
+    devices = config["devices"]
+    match = config["match"]
+    mask = config["mask"]
+    offset = config["offset"]
+    debounce_seconds = config["debounce_seconds"]
+    report_size = config["report_size"]
+    match_streak = config["match_streak"]
+    release_streak = config["release_streak"]
+    trace_matches = config["trace_matches"]
+    trace_limit = config["trace_limit"]
+    trace_window_only = config["trace_window_only"]
+
+    log_button_config(config, target_input=target_input, mode="listen")
+
+    device_list = ", ".join(device["devnode"] for device in devices)
+    print(f"Listening for button reports on {device_list}...")
+
+    selector, handles = open_hid_devices(devices)
+    last_trigger_at = 0.0
+    button_is_down_by_fd = {}
+    consecutive_matches_by_fd = {}
+    consecutive_non_matches_by_fd = {}
+    previous_trace_by_fd = {}
+    traces_emitted = 0
+
+    try:
+        while True:
+            events = selector.select(timeout=0.5)
+
+            if not events:
+                continue
+
+            for key, _ in events:
+                report = os.read(key.fd, report_size)
+
+                if not report:
+                    continue
+
+                matched = report_button_pressed(report, config)
+
+                if matched is None:
+                    continue
+
+                button_is_down = button_is_down_by_fd.get(key.fd, False)
+                consecutive_matches = consecutive_matches_by_fd.get(key.fd, 0)
+                consecutive_non_matches = consecutive_non_matches_by_fd.get(
+                    key.fd,
+                    0,
+                )
+                trace_window = format_match_window(report, offset, len(match))
+
+                if trace_matches and traces_emitted < trace_limit:
+                    if trace_window_only:
+                        trace_state = (
+                            trace_window,
+                            matched,
+                            button_is_down,
+                        )
+                    else:
+                        trace_state = (
+                            report,
+                            matched,
+                            button_is_down,
+                            consecutive_matches,
+                            consecutive_non_matches,
+                        )
+                    if previous_trace_by_fd.get(key.fd) != trace_state:
+                        print(
+                            "Listener report: "
+                            f"device={key.data['devnode']} "
+                            f"matched={matched} "
+                            f"button_is_down={button_is_down} "
+                            f"match_streak_count={consecutive_matches} "
+                            f"release_streak_count={consecutive_non_matches} "
+                            f"window={trace_window} "
+                            f"report={report.hex()}"
+                        )
+                        previous_trace_by_fd[key.fd] = trace_state
+                        traces_emitted += 1
+
+                if matched and not button_is_down:
+                    consecutive_matches += 1
+                    consecutive_matches_by_fd[key.fd] = consecutive_matches
+                    consecutive_non_matches_by_fd[key.fd] = 0
+
+                    if trace_matches and traces_emitted < trace_limit:
+                        print(
+                            "Listener match streak advanced: "
+                            f"device={key.data['devnode']} "
+                            f"count={consecutive_matches}/{match_streak} "
+                            f"window={trace_window}"
+                        )
+                        traces_emitted += 1
+
+                    if consecutive_matches < match_streak:
+                        continue
+
+                    now = time.time()
+
+                    if now - last_trigger_at >= debounce_seconds:
+                        print(
+                            "Matched button press on "
+                            f"{key.data['devnode']}. Triggering TV action."
+                        )
+                        run_tv_action(target_input)
+                        last_trigger_at = now
+                    elif trace_matches and traces_emitted < trace_limit:
+                        print(
+                            "Listener match suppressed by debounce: "
+                            f"device={key.data['devnode']} "
+                            f"window={trace_window}"
+                        )
+                        traces_emitted += 1
+
+                    button_is_down_by_fd[key.fd] = True
+
+                    if trace_matches and traces_emitted < trace_limit:
+                        print(
+                            "Listener button latched down: "
+                            f"device={key.data['devnode']} "
+                            f"window={trace_window}"
+                        )
+                        traces_emitted += 1
+
+                elif not matched:
+                    consecutive_matches_by_fd[key.fd] = 0
+                    consecutive_non_matches += 1
+                    consecutive_non_matches_by_fd[key.fd] = (
+                        consecutive_non_matches
+                    )
+
+                    if button_is_down and consecutive_non_matches >= release_streak:
+                        button_is_down_by_fd[key.fd] = False
+                        if trace_matches and traces_emitted < trace_limit:
+                            print(
+                                "Listener button released: "
+                                f"device={key.data['devnode']} "
+                                f"count={consecutive_non_matches}/{release_streak} "
+                                f"window={trace_window}"
+                            )
+                            traces_emitted += 1
+
+                else:
+                    consecutive_non_matches_by_fd[key.fd] = 0
+
+    finally:
+        close_hid_devices(selector, handles)
+
+
+def debug_hid_button(max_reports):
+    config = load_button_config()
+    devices = config["devices"]
+    report_size = config["report_size"]
+
+    log_button_config(config, mode="debug")
+
+    device_list = ", ".join(device["devnode"] for device in devices)
+    print(f"Debugging button reports on {device_list}...")
+    print(f"report_size={report_size}")
+    print(f"match_streak={config['match_streak']}")
+    print(f"release_streak={config['release_streak']}")
+
+    selector, handles = open_hid_devices(devices)
+    previous_reports = {}
+    seen = 0
+
+    try:
+        while max_reports <= 0 or seen < max_reports:
+            events = selector.select(timeout=0.5)
+
+            if not events:
+                continue
+
+            for key, _ in events:
+                report = os.read(key.fd, report_size)
+
+                if not report:
+                    continue
+
+                matched = report_button_pressed(report, config)
+
+                if matched is None:
+                    continue
+
+                previous = previous_reports.get(key.fd)
+
+                if previous != (report, matched):
+                    status = "MATCH" if matched else "no-match"
+                    window = format_match_window(
+                        report,
+                        config["offset"],
+                        len(config["match"]),
+                    )
+                    print(
+                        f"{status} device={key.data['devnode']} "
+                        f"report={report.hex()} window={window}"
+                    )
+                    previous_reports[key.fd] = (report, matched)
+                    seen += 1
+
+                    if max_reports > 0 and seen >= max_reports:
+                        break
+
+    finally:
+        close_hid_devices(selector, handles)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument(
+        "--input",
+        dest="target_input",
+        default=os.environ.get("TARGET_INPUT"),
+        help="TV input ID to switch to after wake.",
+    )
+
+    listen_parser = subparsers.add_parser("listen-hid-button")
+    listen_parser.add_argument(
+        "--input",
+        dest="target_input",
+        default=os.environ.get("TARGET_INPUT"),
+        help="TV input ID to switch to after a matched button event.",
+    )
+
+    debug_parser = subparsers.add_parser("debug-hid-button")
+    debug_parser.add_argument(
+        "--max-reports",
+        type=int,
+        default=read_env_int(
+            "BUTTON_DEBUG_MAX_REPORTS",
+            DEFAULT_DEBUG_MAX_REPORTS,
+        ),
+        help="Stop after printing this many button events. 0 means no limit.",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    configure_stdio()
+
+    args = parse_args()
+    command = args.command or "run"
+
+    if command == "debug-hid-button":
+        debug_hid_button(args.max_reports)
+        return 0
+
+    target_input = getattr(
+        args,
+        "target_input",
+        os.environ.get("TARGET_INPUT"),
+    )
+
+    if not target_input:
+        raise RuntimeError(
+            "A target input is required via --input or TARGET_INPUT."
+        )
+
+    if command == "listen-hid-button":
+        listen_for_hid_button(target_input)
+        return 0
+
+    return run_tv_action(target_input)
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
