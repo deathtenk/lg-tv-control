@@ -25,6 +25,7 @@ DEFAULT_DEBOUNCE_SECONDS = 3.0
 DEFAULT_LOCK_FILE = "/tmp/lg-tv-control.lock"
 DEFAULT_HID_REPORT_SIZE = 64
 DEFAULT_DEBUG_MAX_REPORTS = 0
+DEFAULT_MATCH_STREAK = 2
 
 
 def configure_stdio():
@@ -214,6 +215,10 @@ def load_button_config():
         "BUTTON_REPORT_SIZE",
         DEFAULT_HID_REPORT_SIZE,
     )
+    match_streak = read_env_int(
+        "BUTTON_MATCH_STREAK",
+        DEFAULT_MATCH_STREAK,
+    )
 
     if mask_hex:
         mask = parse_hex_bytes(mask_hex)
@@ -233,6 +238,7 @@ def load_button_config():
         "offset": offset,
         "debounce_seconds": debounce_seconds,
         "report_size": report_size,
+        "match_streak": match_streak,
     }
 
 
@@ -538,6 +544,7 @@ def listen_for_hid_button(target_input):
     offset = config["offset"]
     debounce_seconds = config["debounce_seconds"]
     report_size = config["report_size"]
+    match_streak = config["match_streak"]
 
     device_list = ", ".join(device["devnode"] for device in devices)
     print(f"Listening for button reports on {device_list}...")
@@ -545,6 +552,7 @@ def listen_for_hid_button(target_input):
     selector, handles = open_hid_devices(devices)
     last_trigger_at = 0.0
     button_is_down_by_fd = {}
+    consecutive_matches_by_fd = {}
 
     try:
         while True:
@@ -561,8 +569,15 @@ def listen_for_hid_button(target_input):
 
                 matched = report_matches(report, match, mask, offset)
                 button_is_down = button_is_down_by_fd.get(key.fd, False)
+                consecutive_matches = consecutive_matches_by_fd.get(key.fd, 0)
 
                 if matched and not button_is_down:
+                    consecutive_matches += 1
+                    consecutive_matches_by_fd[key.fd] = consecutive_matches
+
+                    if consecutive_matches < match_streak:
+                        continue
+
                     now = time.time()
 
                     if now - last_trigger_at >= debounce_seconds:
@@ -577,6 +592,7 @@ def listen_for_hid_button(target_input):
 
                 elif not matched:
                     button_is_down_by_fd[key.fd] = False
+                    consecutive_matches_by_fd[key.fd] = 0
 
     finally:
         close_hid_devices(selector, handles)
@@ -596,6 +612,7 @@ def debug_hid_button(max_reports):
     print(f"match_offset={offset}")
     print(f"match_hex={match.hex()}")
     print(f"match_mask={mask.hex()}")
+    print(f"match_streak={config['match_streak']}")
 
     selector, handles = open_hid_devices(devices)
     previous_reports = {}
