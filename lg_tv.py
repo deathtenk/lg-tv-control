@@ -26,6 +26,7 @@ DEFAULT_LOCK_FILE = "/tmp/lg-tv-control.lock"
 DEFAULT_HID_REPORT_SIZE = 64
 DEFAULT_DEBUG_MAX_REPORTS = 0
 DEFAULT_MATCH_STREAK = 2
+DEFAULT_RELEASE_STREAK = 3
 
 
 def configure_stdio():
@@ -219,6 +220,10 @@ def load_button_config():
         "BUTTON_MATCH_STREAK",
         DEFAULT_MATCH_STREAK,
     )
+    release_streak = read_env_int(
+        "BUTTON_RELEASE_STREAK",
+        DEFAULT_RELEASE_STREAK,
+    )
 
     if mask_hex:
         mask = parse_hex_bytes(mask_hex)
@@ -239,7 +244,27 @@ def load_button_config():
         "debounce_seconds": debounce_seconds,
         "report_size": report_size,
         "match_streak": match_streak,
+        "release_streak": release_streak,
     }
+
+
+def log_button_config(config, target_input=None, mode="listen"):
+    device_list = ", ".join(device["devnode"] for device in config["devices"])
+    print(
+        "Loaded HID button config: "
+        f"mode={mode} "
+        f"devices={device_list} "
+        f"report_size={config['report_size']} "
+        f"match_offset={config['offset']} "
+        f"match_hex={config['match'].hex()} "
+        f"match_mask={config['mask'].hex()} "
+        f"match_streak={config['match_streak']} "
+        f"release_streak={config['release_streak']} "
+        f"debounce_seconds={config['debounce_seconds']}"
+    )
+
+    if target_input is not None:
+        print(f"Loaded target input: {target_input}")
 
 
 def load_store():
@@ -545,6 +570,9 @@ def listen_for_hid_button(target_input):
     debounce_seconds = config["debounce_seconds"]
     report_size = config["report_size"]
     match_streak = config["match_streak"]
+    release_streak = config["release_streak"]
+
+    log_button_config(config, target_input=target_input, mode="listen")
 
     device_list = ", ".join(device["devnode"] for device in devices)
     print(f"Listening for button reports on {device_list}...")
@@ -553,6 +581,7 @@ def listen_for_hid_button(target_input):
     last_trigger_at = 0.0
     button_is_down_by_fd = {}
     consecutive_matches_by_fd = {}
+    consecutive_non_matches_by_fd = {}
 
     try:
         while True:
@@ -570,10 +599,15 @@ def listen_for_hid_button(target_input):
                 matched = report_matches(report, match, mask, offset)
                 button_is_down = button_is_down_by_fd.get(key.fd, False)
                 consecutive_matches = consecutive_matches_by_fd.get(key.fd, 0)
+                consecutive_non_matches = consecutive_non_matches_by_fd.get(
+                    key.fd,
+                    0,
+                )
 
                 if matched and not button_is_down:
                     consecutive_matches += 1
                     consecutive_matches_by_fd[key.fd] = consecutive_matches
+                    consecutive_non_matches_by_fd[key.fd] = 0
 
                     if consecutive_matches < match_streak:
                         continue
@@ -591,8 +625,17 @@ def listen_for_hid_button(target_input):
                     button_is_down_by_fd[key.fd] = True
 
                 elif not matched:
-                    button_is_down_by_fd[key.fd] = False
                     consecutive_matches_by_fd[key.fd] = 0
+                    consecutive_non_matches += 1
+                    consecutive_non_matches_by_fd[key.fd] = (
+                        consecutive_non_matches
+                    )
+
+                    if button_is_down and consecutive_non_matches >= release_streak:
+                        button_is_down_by_fd[key.fd] = False
+
+                else:
+                    consecutive_non_matches_by_fd[key.fd] = 0
 
     finally:
         close_hid_devices(selector, handles)
@@ -606,6 +649,8 @@ def debug_hid_button(max_reports):
     offset = config["offset"]
     report_size = config["report_size"]
 
+    log_button_config(config, mode="debug")
+
     device_list = ", ".join(device["devnode"] for device in devices)
     print(f"Debugging button reports on {device_list}...")
     print(f"report_size={report_size}")
@@ -613,6 +658,7 @@ def debug_hid_button(max_reports):
     print(f"match_hex={match.hex()}")
     print(f"match_mask={mask.hex()}")
     print(f"match_streak={config['match_streak']}")
+    print(f"release_streak={config['release_streak']}")
 
     selector, handles = open_hid_devices(devices)
     previous_reports = {}
