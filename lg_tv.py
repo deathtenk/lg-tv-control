@@ -13,7 +13,7 @@ from pathlib import Path
 
 from wakeonlan import wake
 from pywebostv.connection import WebOSClient
-from pywebostv.controls import SourceControl
+from pywebostv.controls import ApplicationControl, SourceControl
 
 
 TV_REACHABLE_TIMEOUT = 20
@@ -341,6 +341,7 @@ def connect_webos(
 
 def switch_to_input(client, target_input):
     source_control = SourceControl(client)
+    application_control = ApplicationControl(client)
     sources = source_control.list_sources()
 
     print("Available inputs:")
@@ -363,6 +364,34 @@ def switch_to_input(client, target_input):
         raise RuntimeError(
             f"{target_input} wasn't found in the TV's source list."
         )
+
+    current_app_id = None
+
+    try:
+        current_app_id = application_control.get_current()
+        print(f"Current foreground app: {current_app_id}")
+    except Exception as e:
+        print(f"Could not determine current foreground app: {e}")
+
+    target_app_ids = set()
+
+    for key in ("appId", "launcherAppId"):
+        value = target.data.get(key)
+
+        if value:
+            target_app_ids.add(value)
+
+    normalized_target = target_input.lower().replace("_", "")
+
+    if normalized_target.startswith("hdmi"):
+        target_app_ids.add(f"com.webos.app.{normalized_target}")
+
+    if current_app_id and current_app_id in target_app_ids:
+        print(
+            f"TV is already on {target_input} "
+            f"({current_app_id}). Skipping input switch."
+        )
+        return
 
     print(f"Switching to {target_input}...")
     source_control.set_source(target)
