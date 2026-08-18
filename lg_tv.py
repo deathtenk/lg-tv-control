@@ -8,6 +8,7 @@ import os
 import socket
 import sys
 import time
+from pathlib import Path
 
 from wakeonlan import wake
 from pywebostv.connection import WebOSClient
@@ -76,8 +77,119 @@ def read_env_int(name, default):
     return int(value)
 
 
+def parse_hid_id(value):
+    parts = [part.strip().lower() for part in value.split(":")]
+
+    if len(parts) == 3:
+        bus, vendor, product = parts
+        return (
+            int(bus, 16),
+            int(vendor, 16),
+            int(product, 16),
+        )
+
+    if len(parts) == 2:
+        vendor, product = parts
+        return (None, int(vendor, 16), int(product, 16))
+
+    raise ValueError(
+        "HID device IDs must be BUS:VENDOR:PRODUCT or VENDOR:PRODUCT."
+    )
+
+
+def build_hid_id_candidates(value):
+    bus, vendor, product = parse_hid_id(value)
+    candidates = {
+        f"{vendor:04x}:{product:04x}",
+        f"{vendor:08x}:{product:08x}",
+    }
+
+    if bus is not None:
+        candidates.add(f"{bus:04x}:{vendor:04x}:{product:04x}")
+        candidates.add(f"{bus:04x}:{vendor:08x}:{product:08x}")
+
+    return candidates
+
+
+def read_sysfs_uevent(path):
+    data = {}
+
+    for line in path.read_text().splitlines():
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        data[key] = value
+
+    return data
+
+
+def hid_id_candidates_from_uevent(uevent):
+    hid_id = uevent.get("HID_ID")
+
+    if not hid_id:
+        return set()
+
+    return build_hid_id_candidates(hid_id)
+
+
+def resolve_button_device():
+    explicit_device = os.environ.get("BUTTON_DEVICE")
+
+    if explicit_device:
+        return explicit_device
+
+    button_device_id = require_env("BUTTON_DEVICE_ID")
+    target_candidates = build_hid_id_candidates(button_device_id)
+    matches = []
+
+    for hidraw_path in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        uevent_path = hidraw_path / "device" / "uevent"
+
+        if not uevent_path.exists():
+            continue
+
+        uevent = read_sysfs_uevent(uevent_path)
+        current_candidates = hid_id_candidates_from_uevent(uevent)
+
+        if not target_candidates.intersection(current_candidates):
+            continue
+
+        devnode = f"/dev/{hidraw_path.name}"
+        matches.append(
+            {
+                "devnode": devnode,
+                "hid_id": uevent.get("HID_ID", ""),
+                "name": uevent.get("HID_NAME", ""),
+            }
+        )
+
+    if not matches:
+        raise RuntimeError(
+            f"Could not find a hidraw device for BUTTON_DEVICE_ID="
+            f"{button_device_id}."
+        )
+
+    if len(matches) > 1:
+        match_list = ", ".join(
+            f"{match['devnode']} ({match['hid_id']} {match['name']})"
+            for match in matches
+        )
+        raise RuntimeError(
+            f"BUTTON_DEVICE_ID={button_device_id} matched multiple "
+            f"hidraw devices: {match_list}"
+        )
+
+    match = matches[0]
+    print(
+        f"Resolved BUTTON_DEVICE_ID={button_device_id} to "
+        f"{match['devnode']} ({match['hid_id']} {match['name']})"
+    )
+    return match["devnode"]
+
+
 def load_button_config():
-    device = require_env("BUTTON_DEVICE")
+    device = resolve_button_device()
     match = parse_hex_bytes(require_env("BUTTON_MATCH_HEX"))
     mask_hex = os.environ.get("BUTTON_MATCH_MASK_HEX")
     offset = read_env_int("BUTTON_MATCH_OFFSET", 0)
