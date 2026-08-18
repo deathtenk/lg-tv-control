@@ -78,10 +78,10 @@ fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable lg-tv-control-resume.service
-sudo systemctl enable lg-tv-control-steam-button.service
+sudo systemctl enable --now lg-tv-control-steam-button.service
 
 if [[ "$ENABLE_DEBUG_SERVICE" == "true" ]]; then
-  sudo systemctl enable lg-tv-control-debug.service
+  sudo systemctl enable --now lg-tv-control-debug.service
 fi
 
 echo "lg-tv-control-resume service installed."
