@@ -1,2 +1,5 @@
+__pycache__/
 tv.sh
 dist/
+hid-captures
+lg-tv-control.env
