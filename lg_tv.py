@@ -19,6 +19,8 @@ from pywebostv.controls import ApplicationControl, SourceControl
 TV_REACHABLE_TIMEOUT = 20
 WEBOS_CONNECT_TIMEOUT = 30
 WEBOS_RETRY_DELAY = 2
+TV_PROBE_TIMEOUT = 2
+WEBOS_PROBE_TIMEOUT = 5
 DEFAULT_DEBOUNCE_SECONDS = 3.0
 DEFAULT_LOCK_FILE = "/tmp/lg-tv-control.lock"
 DEFAULT_HID_REPORT_SIZE = 64
@@ -391,12 +393,28 @@ def switch_to_input(client, target_input):
             f"TV is already on {target_input} "
             f"({current_app_id}). Skipping input switch."
         )
-        return
+        return False
 
     print(f"Switching to {target_input}...")
     source_control.set_source(target)
 
     print("Done.")
+    return True
+
+
+def connect_and_ensure_input(tv_ip, target_input, timeout):
+    store = load_store()
+    client = connect_webos(tv_ip, store, timeout=timeout)
+
+    try:
+        # Registration can update the client key in the store.
+        save_store(store)
+        switch_to_input(client, target_input)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def acquire_action_lock():
@@ -423,6 +441,20 @@ def run_tv_action(target_input):
         return 0
 
     try:
+        if wait_for_tv(tv_ip, timeout=TV_PROBE_TIMEOUT):
+            print("TV is already reachable. Checking current input before waking.")
+
+            try:
+                connect_and_ensure_input(
+                    tv_ip,
+                    target_input,
+                    timeout=WEBOS_PROBE_TIMEOUT,
+                )
+                return 0
+            except Exception as e:
+                print(f"Reachability probe could not confirm state: {e}")
+                print("Falling back to Wake-on-LAN flow.")
+
         print(f"Waking TV at {tv_mac}...")
         wake(tv_mac)
 
@@ -432,21 +464,11 @@ def run_tv_action(target_input):
                 f"{TV_REACHABLE_TIMEOUT} seconds."
             )
 
-        store = load_store()
-
-        client = connect_webos(tv_ip, store)
-
-        try:
-            # Registration can update the client key in the store.
-            save_store(store)
-
-            switch_to_input(client, target_input)
-
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+        connect_and_ensure_input(
+            tv_ip,
+            target_input,
+            timeout=WEBOS_CONNECT_TIMEOUT,
+        )
 
         return 0
 
