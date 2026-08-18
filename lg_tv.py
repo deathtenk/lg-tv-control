@@ -5,6 +5,7 @@ import binascii
 import fcntl
 import json
 import os
+import selectors
 import socket
 import sys
 import time
@@ -133,11 +134,11 @@ def hid_id_candidates_from_uevent(uevent):
     return build_hid_id_candidates(hid_id)
 
 
-def resolve_button_device():
+def resolve_button_devices():
     explicit_device = os.environ.get("BUTTON_DEVICE")
 
     if explicit_device:
-        return explicit_device
+        return [{"devnode": explicit_device, "hid_id": "", "name": ""}]
 
     button_device_id = require_env("BUTTON_DEVICE_ID")
     target_candidates = build_hid_id_candidates(button_device_id)
@@ -175,21 +176,22 @@ def resolve_button_device():
             f"{match['devnode']} ({match['hid_id']} {match['name']})"
             for match in matches
         )
-        raise RuntimeError(
+        print(
             f"BUTTON_DEVICE_ID={button_device_id} matched multiple "
-            f"hidraw devices: {match_list}"
+            f"hidraw devices. Listening on all of them: {match_list}"
+        )
+    else:
+        match = matches[0]
+        print(
+            f"Resolved BUTTON_DEVICE_ID={button_device_id} to "
+            f"{match['devnode']} ({match['hid_id']} {match['name']})"
         )
 
-    match = matches[0]
-    print(
-        f"Resolved BUTTON_DEVICE_ID={button_device_id} to "
-        f"{match['devnode']} ({match['hid_id']} {match['name']})"
-    )
-    return match["devnode"]
+    return matches
 
 
 def load_button_config():
-    device = resolve_button_device()
+    devices = resolve_button_devices()
     match = parse_hex_bytes(require_env("BUTTON_MATCH_HEX"))
     mask_hex = os.environ.get("BUTTON_MATCH_MASK_HEX")
     offset = read_env_int("BUTTON_MATCH_OFFSET", 0)
@@ -214,7 +216,7 @@ def load_button_config():
         )
 
     return {
-        "device": device,
+        "devices": devices,
         "match": match,
         "mask": mask,
         "offset": offset,
@@ -443,90 +445,132 @@ def format_match_window(report, offset, length):
     return report[offset:end].hex()
 
 
+def open_hid_devices(devices):
+    selector = selectors.DefaultSelector()
+    handles = []
+
+    for device in devices:
+        fd = os.open(device["devnode"], os.O_RDONLY)
+        selector.register(fd, selectors.EVENT_READ, data=device)
+        handles.append(fd)
+
+    return selector, handles
+
+
+def close_hid_devices(selector, handles):
+    for fd in handles:
+        try:
+            selector.unregister(fd)
+        except Exception:
+            pass
+
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
 def listen_for_hid_button(target_input):
     config = load_button_config()
-    device = config["device"]
+    devices = config["devices"]
     match = config["match"]
     mask = config["mask"]
     offset = config["offset"]
     debounce_seconds = config["debounce_seconds"]
     report_size = config["report_size"]
 
-    print(f"Listening for button reports on {device}...")
+    device_list = ", ".join(device["devnode"] for device in devices)
+    print(f"Listening for button reports on {device_list}...")
 
-    fd = os.open(device, os.O_RDONLY)
+    selector, handles = open_hid_devices(devices)
     last_trigger_at = 0.0
     button_is_down = False
 
     try:
         while True:
-            report = os.read(fd, report_size)
+            events = selector.select(timeout=0.5)
 
-            if not report:
-                time.sleep(0.05)
+            if not events:
                 continue
 
-            matched = report_matches(report, match, mask, offset)
+            for key, _ in events:
+                report = os.read(key.fd, report_size)
 
-            if matched and not button_is_down:
-                now = time.time()
+                if not report:
+                    continue
 
-                if now - last_trigger_at >= debounce_seconds:
-                    print("Matched button press. Triggering TV action.")
-                    run_tv_action(target_input)
-                    last_trigger_at = now
+                matched = report_matches(report, match, mask, offset)
 
-                button_is_down = True
+                if matched and not button_is_down:
+                    now = time.time()
 
-            elif not matched:
-                button_is_down = False
+                    if now - last_trigger_at >= debounce_seconds:
+                        print(
+                            "Matched button press on "
+                            f"{key.data['devnode']}. Triggering TV action."
+                        )
+                        run_tv_action(target_input)
+                        last_trigger_at = now
+
+                    button_is_down = True
+
+                elif not matched:
+                    button_is_down = False
 
     finally:
-        os.close(fd)
+        close_hid_devices(selector, handles)
 
 
 def debug_hid_button(max_reports):
     config = load_button_config()
-    device = config["device"]
+    devices = config["devices"]
     match = config["match"]
     mask = config["mask"]
     offset = config["offset"]
     report_size = config["report_size"]
 
-    print(f"Debugging button reports on {device}...")
+    device_list = ", ".join(device["devnode"] for device in devices)
+    print(f"Debugging button reports on {device_list}...")
     print(f"report_size={report_size}")
     print(f"match_offset={offset}")
     print(f"match_hex={match.hex()}")
     print(f"match_mask={mask.hex()}")
 
-    fd = os.open(device, os.O_RDONLY)
-    previous_report = None
-    previous_matched = None
+    selector, handles = open_hid_devices(devices)
+    previous_reports = {}
     seen = 0
 
     try:
         while max_reports <= 0 or seen < max_reports:
-            report = os.read(fd, report_size)
+            events = selector.select(timeout=0.5)
 
-            if not report:
-                time.sleep(0.05)
+            if not events:
                 continue
 
-            matched = report_matches(report, match, mask, offset)
+            for key, _ in events:
+                report = os.read(key.fd, report_size)
 
-            if report != previous_report or matched != previous_matched:
-                status = "MATCH" if matched else "no-match"
-                window = format_match_window(report, offset, len(match))
-                print(
-                    f"{status} report={report.hex()} "
-                    f"window={window}"
-                )
-                previous_report = report
-                previous_matched = matched
-                seen += 1
+                if not report:
+                    continue
+
+                matched = report_matches(report, match, mask, offset)
+                previous = previous_reports.get(key.fd)
+
+                if previous != (report, matched):
+                    status = "MATCH" if matched else "no-match"
+                    window = format_match_window(report, offset, len(match))
+                    print(
+                        f"{status} device={key.data['devnode']} "
+                        f"report={report.hex()} window={window}"
+                    )
+                    previous_reports[key.fd] = (report, matched)
+                    seen += 1
+
+                    if max_reports > 0 and seen >= max_reports:
+                        break
 
     finally:
-        os.close(fd)
+        close_hid_devices(selector, handles)
 
 
 def parse_args():
