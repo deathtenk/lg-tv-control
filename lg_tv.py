@@ -80,6 +80,15 @@ def read_env_int(name, default):
     return int(value)
 
 
+def build_default_match_mask(match):
+    mask = bytes(0xFF if byte != 0 else 0x00 for byte in match)
+
+    if any(mask):
+        return mask
+
+    return b"\xff" * len(match)
+
+
 def parse_hid_id(value):
     parts = [part.strip().lower() for part in value.split(":")]
 
@@ -209,7 +218,7 @@ def load_button_config():
     if mask_hex:
         mask = parse_hex_bytes(mask_hex)
     else:
-        mask = b"\xff" * len(match)
+        mask = build_default_match_mask(match)
 
     if len(mask) != len(match):
         raise RuntimeError(
@@ -535,7 +544,7 @@ def listen_for_hid_button(target_input):
 
     selector, handles = open_hid_devices(devices)
     last_trigger_at = 0.0
-    button_is_down = False
+    button_is_down_by_fd = {}
 
     try:
         while True:
@@ -551,6 +560,7 @@ def listen_for_hid_button(target_input):
                     continue
 
                 matched = report_matches(report, match, mask, offset)
+                button_is_down = button_is_down_by_fd.get(key.fd, False)
 
                 if matched and not button_is_down:
                     now = time.time()
@@ -563,10 +573,10 @@ def listen_for_hid_button(target_input):
                         run_tv_action(target_input)
                         last_trigger_at = now
 
-                    button_is_down = True
+                    button_is_down_by_fd[key.fd] = True
 
                 elif not matched:
-                    button_is_down = False
+                    button_is_down_by_fd[key.fd] = False
 
     finally:
         close_hid_devices(selector, handles)
