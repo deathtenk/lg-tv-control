@@ -23,6 +23,14 @@ DEFAULT_HID_REPORT_SIZE = 64
 DEFAULT_DEBUG_MAX_REPORTS = 0
 
 
+def configure_stdio():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
+
+
 def require_env(name):
     value = os.environ.get(name)
 
@@ -444,6 +452,8 @@ def parse_args():
 
 
 def main():
+    configure_stdio()
+
     args = parse_args()
     command = args.command or "run"
 
