@@ -283,7 +283,7 @@ def resolve_button_devices():
 def load_button_config():
     devices = resolve_button_devices()
     button_name = os.environ.get("BUTTON_NAME", BUTTON_NAME_STEAM).strip().upper()
-    match = parse_hex_bytes(os.environ.get("BUTTON_MATCH_HEX", "74"))
+    match_hex = os.environ.get("BUTTON_MATCH_HEX")
     steam_press_report = parse_hex_bytes(
         os.environ.get(
             "BUTTON_STEAM_PRESS_HEX",
@@ -296,8 +296,8 @@ def load_button_config():
             DEFAULT_STEAM_RELEASE_REPORT,
         )
     )
-    mask_hex = os.environ.get("BUTTON_MATCH_MASK_HEX", "fe")
-    offset = read_env_int("BUTTON_MATCH_OFFSET", 33)
+    mask_hex = os.environ.get("BUTTON_MATCH_MASK_HEX")
+    offset = read_env_int("BUTTON_MATCH_OFFSET", 0)
     debounce_seconds = read_env_float(
         "BUTTON_DEBOUNCE_SECONDS",
         DEFAULT_DEBOUNCE_SECONDS,
@@ -324,12 +324,19 @@ def load_button_config():
         DEFAULT_TRACE_WINDOW_ONLY,
     )
 
-    if mask_hex:
+    if match_hex:
+        match = parse_hex_bytes(match_hex)
+    else:
+        match = b""
+
+    if not match:
+        mask = b""
+    elif mask_hex:
         mask = parse_hex_bytes(mask_hex)
     else:
         mask = build_default_match_mask(match)
 
-    if len(mask) != len(match):
+    if match and len(mask) != len(match):
         raise RuntimeError(
             "BUTTON_MATCH_MASK_HEX must be the same length as "
             "BUTTON_MATCH_HEX."
@@ -362,8 +369,6 @@ def log_button_config(config, target_input=None, mode="listen"):
         f"button_name={config['button_name']} "
         f"report_size={config['report_size']} "
         f"match_offset={config['offset']} "
-        f"match_hex={config['match'].hex()} "
-        f"match_mask={config['mask'].hex()} "
         f"steam_press_hex={config['steam_press_report'].hex()} "
         f"steam_release_hex={config['steam_release_report'].hex()} "
         f"match_streak={config['match_streak']} "
@@ -373,6 +378,14 @@ def log_button_config(config, target_input=None, mode="listen"):
         f"trace_window_only={config['trace_window_only']} "
         f"debounce_seconds={config['debounce_seconds']}"
     )
+
+    if config["match"]:
+        print(
+            "Loaded fallback byte matcher: "
+            f"match_offset={config['offset']} "
+            f"match_hex={config['match'].hex()} "
+            f"match_mask={config['mask'].hex()}"
+        )
 
     if target_input is not None:
         print(f"Loaded target input: {target_input}")
@@ -697,6 +710,9 @@ def report_button_pressed(report, config):
         if report == config["steam_release_report"]:
             return False
 
+        if not config["match"]:
+            return None
+
         return report_matches(
             report,
             config["match"],
@@ -963,36 +979,24 @@ def parse_args():
         help="TV input ID to switch to after wake.",
     )
 
-    for command_name in ("listen-hid-button", "listen-evdev-button"):
-        listen_parser = subparsers.add_parser(
-            command_name,
-            help=(
-                argparse.SUPPRESS if command_name == "listen-evdev-button" else None
-            ),
-        )
-        listen_parser.add_argument(
+    listen_parser = subparsers.add_parser("listen-hid-button")
+    listen_parser.add_argument(
         "--input",
         dest="target_input",
         default=os.environ.get("TARGET_INPUT"),
         help="TV input ID to switch to after a matched button event.",
-        )
+    )
 
-    for command_name in ("debug-hid-button", "debug-evdev-button"):
-        debug_parser = subparsers.add_parser(
-            command_name,
-            help=(
-                argparse.SUPPRESS if command_name == "debug-evdev-button" else None
-            ),
-        )
-        debug_parser.add_argument(
-            "--max-reports",
-            type=int,
-            default=read_env_int(
-                "BUTTON_DEBUG_MAX_REPORTS",
-                DEFAULT_DEBUG_MAX_REPORTS,
-            ),
-            help="Stop after printing this many button events. 0 means no limit.",
-        )
+    debug_parser = subparsers.add_parser("debug-hid-button")
+    debug_parser.add_argument(
+        "--max-reports",
+        type=int,
+        default=read_env_int(
+            "BUTTON_DEBUG_MAX_REPORTS",
+            DEFAULT_DEBUG_MAX_REPORTS,
+        ),
+        help="Stop after printing this many button events. 0 means no limit.",
+    )
 
     return parser.parse_args()
 
@@ -1003,12 +1007,7 @@ def main():
     args = parse_args()
     command = args.command or "run"
 
-    if command in {"debug-evdev-button", "debug-hid-button"}:
-        if command == "debug-evdev-button":
-            print(
-                "debug-evdev-button is deprecated. "
-                "Using the raw Valve HID parser instead."
-            )
+    if command == "debug-hid-button":
         debug_hid_button(args.max_reports)
         return 0
 
@@ -1023,12 +1022,7 @@ def main():
             "A target input is required via --input or TARGET_INPUT."
         )
 
-    if command in {"listen-evdev-button", "listen-hid-button"}:
-        if command == "listen-evdev-button":
-            print(
-                "listen-evdev-button is deprecated. "
-                "Using the raw Valve HID parser instead."
-            )
+    if command == "listen-hid-button":
         listen_for_hid_button(target_input)
         return 0
 
