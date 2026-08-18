@@ -7,7 +7,6 @@ import json
 import os
 import selectors
 import socket
-import struct
 import sys
 import time
 from pathlib import Path
@@ -30,22 +29,59 @@ DEFAULT_MATCH_STREAK = 2
 DEFAULT_RELEASE_STREAK = 3
 DEFAULT_TRACE_LIMIT = 200
 DEFAULT_TRACE_WINDOW_ONLY = True
-EV_KEY = 0x01
-BTN_MODE = 0x13C
-BUTTON_EVENT_NAMES = {
-    BTN_MODE: "BTN_MODE",
+STEAM_CONTROLLER_2026_REPORT_SIZE = 54
+STEAM_CONTROLLER_2026_REPORT_ID = 0x42
+STEAM_CONTROLLER_2026_BUTTON_BITS = {
+    "A": (2, 0),
+    "B": (2, 1),
+    "X": (2, 2),
+    "Y": (2, 3),
+    "R5": (3, 0),
+    "R1": (3, 1),
+    "L4": (4, 1),
+    "L5": (4, 2),
+    "L1": (4, 3),
+    "R4": (2, 7),
 }
-INPUT_EVENT_STRUCT = struct.Struct("llHHi")
-INPUT_EVENT_SIZE = INPUT_EVENT_STRUCT.size
-_IOC_NRBITS = 8
-_IOC_TYPEBITS = 8
-_IOC_SIZEBITS = 14
-_IOC_DIRBITS = 2
-_IOC_NRSHIFT = 0
-_IOC_TYPESHIFT = _IOC_NRSHIFT + _IOC_NRBITS
-_IOC_SIZESHIFT = _IOC_TYPESHIFT + _IOC_TYPEBITS
-_IOC_DIRSHIFT = _IOC_SIZESHIFT + _IOC_SIZEBITS
-_IOC_READ = 2
+STEAM_DECK_BUTTON_BITS = {
+    "R2": (8, 0),
+    "L2": (8, 1),
+    "R1": (8, 2),
+    "L1": (8, 3),
+    "Y": (8, 4),
+    "B": (8, 5),
+    "X": (8, 6),
+    "A": (8, 7),
+    "L5": (9, 7),
+    "R5": (10, 0),
+    "L4": (13, 1),
+    "R4": (13, 2),
+}
+STEAM_DECK_TRIGGER_OFFSETS = {
+    "L2": 44,
+    "R2": 46,
+}
+STEAM_DECK_TRIGGER_THRESHOLD = 16384
+STEAM_DECK_REPORT_SIZE = 64
+STEAM_DECK_REPORT_TYPE = 9
+STEAM_CONTROLLER_REPORT_TYPE = 1
+STEAM_CONTROLLER_BUTTON_BITS = {
+    name: location
+    for name, location in STEAM_DECK_BUTTON_BITS.items()
+    if name not in ("L4", "R4")
+}
+STEAM_CONTROLLER_TRIGGER_OFFSETS = {
+    "L2": 11,
+    "R2": 12,
+}
+STEAM_CONTROLLER_TRIGGER_THRESHOLD = 128
+STEAM_HID_INTERFACES = {
+    "0003:000028DE:00001205": ("/input2",),
+    "0003:000028DE:00001102": ("/input2",),
+    "0003:000028DE:00001142": ("/input1", "/input2"),
+    "0003:000028DE:00001304": ("/input2",),
+}
+BUTTON_NAME_STEAM = "STEAM"
 
 
 def configure_stdio():
@@ -158,18 +194,6 @@ def build_hid_id_candidates(value):
     return candidates
 
 
-def build_hid_id_candidates_from_product(value):
-    parts = [part.strip().lower() for part in value.split("/")]
-
-    if len(parts) < 3:
-        return set()
-
-    bus = int(parts[0], 16)
-    vendor = int(parts[1], 16)
-    product = int(parts[2], 16)
-    return build_hid_id_candidates(f"{bus:04x}:{vendor:04x}:{product:04x}")
-
-
 def read_sysfs_uevent(path):
     data = {}
 
@@ -184,156 +208,11 @@ def read_sysfs_uevent(path):
 
 
 def hid_id_candidates_from_uevent(uevent):
-    candidates = set()
     hid_id = uevent.get("HID_ID")
-    product = uevent.get("PRODUCT")
+    if not hid_id:
+        return set()
 
-    if hid_id:
-        candidates.update(build_hid_id_candidates(hid_id))
-
-    if product:
-        candidates.update(build_hid_id_candidates_from_product(product))
-
-    return candidates
-
-
-def _ioc(direction, type_, number, size):
-    return (
-        (direction << _IOC_DIRSHIFT)
-        | (type_ << _IOC_TYPESHIFT)
-        | (number << _IOC_NRSHIFT)
-        | (size << _IOC_SIZESHIFT)
-    )
-
-
-def eviocgname(length):
-    return _ioc(_IOC_READ, ord("E"), 0x06, length)
-
-
-def eviocgbit(event_type, length):
-    return _ioc(_IOC_READ, ord("E"), 0x20 + event_type, length)
-
-
-def test_bit(bitmap, bit):
-    byte_index = bit // 8
-
-    if byte_index >= len(bitmap):
-        return False
-
-    return (bitmap[byte_index] & (1 << (bit % 8))) != 0
-
-
-def get_input_device_name(fd, fallback=""):
-    buffer = bytearray(256)
-
-    try:
-        fcntl.ioctl(fd, eviocgname(len(buffer)), buffer, True)
-    except OSError:
-        return fallback
-
-    return buffer.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-
-
-def supports_key_code(fd, key_code):
-    bitmap = bytearray((key_code // 8) + 1)
-
-    try:
-        fcntl.ioctl(fd, eviocgbit(EV_KEY, len(bitmap)), bitmap, True)
-    except OSError:
-        return False
-
-    return test_bit(bitmap, key_code)
-
-
-def parse_button_event_code(value):
-    normalized = value.strip().upper()
-
-    if normalized == "BTN_MODE":
-        return BTN_MODE
-
-    return int(value, 0)
-
-
-def get_button_event_name(button_code):
-    return BUTTON_EVENT_NAMES.get(button_code, hex(button_code))
-
-
-def find_input_device_uevent(device_path):
-    for candidate in [device_path, *device_path.parents]:
-        uevent_path = candidate / "uevent"
-
-        if not uevent_path.exists():
-            continue
-
-        uevent = read_sysfs_uevent(uevent_path)
-
-        if hid_id_candidates_from_uevent(uevent):
-            return uevent
-
-    return {}
-
-
-def resolve_button_event_devices(button_code):
-    explicit_device = os.environ.get("BUTTON_EVENT_DEVICE")
-
-    if explicit_device:
-        return [{"devnode": explicit_device, "name": ""}]
-
-    button_device_id = require_env("BUTTON_DEVICE_ID")
-    target_candidates = build_hid_id_candidates(button_device_id)
-    matches = []
-
-    for event_path in sorted(Path("/sys/class/input").glob("event*")):
-        device_path = event_path / "device"
-        uevent = find_input_device_uevent(device_path)
-        current_candidates = hid_id_candidates_from_uevent(uevent)
-
-        if not target_candidates.intersection(current_candidates):
-            continue
-
-        devnode = f"/dev/input/{event_path.name}"
-
-        try:
-            fd = os.open(devnode, os.O_RDONLY)
-        except OSError:
-            continue
-
-        try:
-            if not supports_key_code(fd, button_code):
-                continue
-
-            matches.append(
-                {
-                    "devnode": devnode,
-                    "name": get_input_device_name(fd, fallback=""),
-                }
-            )
-        finally:
-            os.close(fd)
-
-    if not matches:
-        raise RuntimeError(
-            f"Could not find an event device for BUTTON_DEVICE_ID="
-            f"{button_device_id} exposing {get_button_event_name(button_code)}."
-        )
-
-    if len(matches) > 1:
-        match_list = ", ".join(
-            f"{match['devnode']} ({match['name']})"
-            for match in matches
-        )
-        print(
-            f"BUTTON_DEVICE_ID={button_device_id} matched multiple "
-            f"event devices. Listening on all of them: {match_list}"
-        )
-    else:
-        match = matches[0]
-        print(
-            f"Resolved BUTTON_DEVICE_ID={button_device_id} to "
-            f"{match['devnode']} ({match['name']})"
-        )
-
-    return matches
+    return build_hid_id_candidates(hid_id)
 
 
 def resolve_button_devices():
@@ -358,12 +237,19 @@ def resolve_button_devices():
         if not target_candidates.intersection(current_candidates):
             continue
 
+        hid_phys = uevent.get("HID_PHYS", "")
+        allowed_suffixes = STEAM_HID_INTERFACES.get(uevent.get("HID_ID", ""), ())
+
+        if allowed_suffixes and not hid_phys.endswith(allowed_suffixes):
+            continue
+
         devnode = f"/dev/{hidraw_path.name}"
         matches.append(
             {
                 "devnode": devnode,
                 "hid_id": uevent.get("HID_ID", ""),
                 "name": uevent.get("HID_NAME", ""),
+                "hid_phys": hid_phys,
             }
         )
 
@@ -375,7 +261,7 @@ def resolve_button_devices():
 
     if len(matches) > 1:
         match_list = ", ".join(
-            f"{match['devnode']} ({match['hid_id']} {match['name']})"
+            f"{match['devnode']} ({match['hid_id']} {match['name']} {match['hid_phys']})"
             for match in matches
         )
         print(
@@ -386,7 +272,7 @@ def resolve_button_devices():
         match = matches[0]
         print(
             f"Resolved BUTTON_DEVICE_ID={button_device_id} to "
-            f"{match['devnode']} ({match['hid_id']} {match['name']})"
+            f"{match['devnode']} ({match['hid_id']} {match['name']} {match['hid_phys']})"
         )
 
     return matches
@@ -394,9 +280,10 @@ def resolve_button_devices():
 
 def load_button_config():
     devices = resolve_button_devices()
-    match = parse_hex_bytes(require_env("BUTTON_MATCH_HEX"))
-    mask_hex = os.environ.get("BUTTON_MATCH_MASK_HEX")
-    offset = read_env_int("BUTTON_MATCH_OFFSET", 0)
+    button_name = os.environ.get("BUTTON_NAME", BUTTON_NAME_STEAM).strip().upper()
+    match = parse_hex_bytes(os.environ.get("BUTTON_MATCH_HEX", "74"))
+    mask_hex = os.environ.get("BUTTON_MATCH_MASK_HEX", "fe")
+    offset = read_env_int("BUTTON_MATCH_OFFSET", 33)
     debounce_seconds = read_env_float(
         "BUTTON_DEBOUNCE_SECONDS",
         DEFAULT_DEBOUNCE_SECONDS,
@@ -436,6 +323,7 @@ def load_button_config():
 
     return {
         "devices": devices,
+        "button_name": button_name,
         "match": match,
         "mask": mask,
         "offset": offset,
@@ -449,37 +337,13 @@ def load_button_config():
     }
 
 
-def load_button_event_config():
-    button_code = parse_button_event_code(
-        os.environ.get("BUTTON_EVENT_CODE", "BTN_MODE")
-    )
-    devices = resolve_button_event_devices(button_code)
-    debounce_seconds = read_env_float(
-        "BUTTON_DEBOUNCE_SECONDS",
-        DEFAULT_DEBOUNCE_SECONDS,
-    )
-    trace_matches = read_env_bool("BUTTON_TRACE_MATCHES", False)
-    trace_limit = read_env_int(
-        "BUTTON_TRACE_LIMIT",
-        DEFAULT_TRACE_LIMIT,
-    )
-
-    return {
-        "devices": devices,
-        "button_code": button_code,
-        "button_name": get_button_event_name(button_code),
-        "debounce_seconds": debounce_seconds,
-        "trace_matches": trace_matches,
-        "trace_limit": trace_limit,
-    }
-
-
 def log_button_config(config, target_input=None, mode="listen"):
     device_list = ", ".join(device["devnode"] for device in config["devices"])
     print(
         "Loaded HID button config: "
         f"mode={mode} "
         f"devices={device_list} "
+        f"button_name={config['button_name']} "
         f"report_size={config['report_size']} "
         f"match_offset={config['offset']} "
         f"match_hex={config['match'].hex()} "
@@ -489,22 +353,6 @@ def log_button_config(config, target_input=None, mode="listen"):
         f"trace_matches={config['trace_matches']} "
         f"trace_limit={config['trace_limit']} "
         f"trace_window_only={config['trace_window_only']} "
-        f"debounce_seconds={config['debounce_seconds']}"
-    )
-
-    if target_input is not None:
-        print(f"Loaded target input: {target_input}")
-
-
-def log_button_event_config(config, target_input=None, mode="listen"):
-    device_list = ", ".join(device["devnode"] for device in config["devices"])
-    print(
-        "Loaded button event config: "
-        f"mode={mode} "
-        f"devices={device_list} "
-        f"button_code={config['button_name']}({hex(config['button_code'])}) "
-        f"trace_matches={config['trace_matches']} "
-        f"trace_limit={config['trace_limit']} "
         f"debounce_seconds={config['debounce_seconds']}"
     )
 
@@ -776,6 +624,70 @@ def report_matches(report, match, mask, offset):
     return True
 
 
+def raw_button_states(report):
+    if (
+        len(report) == STEAM_CONTROLLER_2026_REPORT_SIZE
+        and report[0] == STEAM_CONTROLLER_2026_REPORT_ID
+    ):
+        return {
+            name: bool(report[byte] & (1 << bit))
+            for name, (byte, bit) in STEAM_CONTROLLER_2026_BUTTON_BITS.items()
+        }
+
+    if (
+        len(report) != STEAM_DECK_REPORT_SIZE
+        or report[0] != 1
+        or report[1] != 0
+    ):
+        return None
+
+    report_type = report[2]
+
+    if report_type == STEAM_DECK_REPORT_TYPE:
+        button_bits = STEAM_DECK_BUTTON_BITS
+        trigger_offsets = STEAM_DECK_TRIGGER_OFFSETS
+        trigger_threshold = STEAM_DECK_TRIGGER_THRESHOLD
+    elif report_type == STEAM_CONTROLLER_REPORT_TYPE:
+        button_bits = STEAM_CONTROLLER_BUTTON_BITS
+        trigger_offsets = STEAM_CONTROLLER_TRIGGER_OFFSETS
+        trigger_threshold = STEAM_CONTROLLER_TRIGGER_THRESHOLD
+    else:
+        return None
+
+    states = {
+        name: bool(report[byte] & (1 << bit))
+        for name, (byte, bit) in button_bits.items()
+    }
+
+    for name, offset in trigger_offsets.items():
+        if report_type == STEAM_DECK_REPORT_TYPE:
+            analog_value = int.from_bytes(report[offset:offset + 2], "little")
+        else:
+            analog_value = report[offset]
+        states[name] = states[name] or analog_value >= trigger_threshold
+
+    return states
+
+
+def report_button_pressed(report, config):
+    button_name = config["button_name"]
+
+    if button_name == BUTTON_NAME_STEAM:
+        return report_matches(
+            report,
+            config["match"],
+            config["mask"],
+            config["offset"],
+        )
+
+    states = raw_button_states(report)
+
+    if states is None:
+        return None
+
+    return states.get(button_name, False)
+
+
 def format_match_window(report, offset, length):
     end = min(len(report), offset + length)
     return report[offset:end].hex()
@@ -804,169 +716,6 @@ def close_hid_devices(selector, handles):
             os.close(fd)
         except Exception:
             pass
-
-
-def open_event_devices(devices):
-    selector = selectors.DefaultSelector()
-    handles = []
-
-    for device in devices:
-        fd = os.open(device["devnode"], os.O_RDONLY)
-        selector.register(fd, selectors.EVENT_READ, data=device)
-        handles.append(fd)
-
-    return selector, handles
-
-
-def close_event_devices(selector, handles):
-    close_hid_devices(selector, handles)
-
-
-def read_input_event(fd):
-    data = os.read(fd, INPUT_EVENT_SIZE)
-
-    if len(data) != INPUT_EVENT_SIZE:
-        return None
-
-    return INPUT_EVENT_STRUCT.unpack(data)
-
-
-def describe_button_event_value(value):
-    if value == 1:
-        return "press"
-
-    if value == 0:
-        return "release"
-
-    if value == 2:
-        return "repeat"
-
-    return str(value)
-
-
-def listen_for_evdev_button(target_input):
-    config = load_button_event_config()
-    devices = config["devices"]
-    button_code = config["button_code"]
-    debounce_seconds = config["debounce_seconds"]
-    trace_matches = config["trace_matches"]
-    trace_limit = config["trace_limit"]
-
-    log_button_event_config(config, target_input=target_input, mode="listen")
-
-    device_list = ", ".join(device["devnode"] for device in devices)
-    print(
-        "Listening for button events on "
-        f"{device_list} ({config['button_name']})..."
-    )
-
-    selector, handles = open_event_devices(devices)
-    last_trigger_at = 0.0
-    button_is_down_by_fd = {}
-    traces_emitted = 0
-
-    try:
-        while True:
-            events = selector.select(timeout=0.5)
-
-            if not events:
-                continue
-
-            for key, _ in events:
-                input_event = read_input_event(key.fd)
-
-                if input_event is None:
-                    continue
-
-                _, _, event_type, event_code, event_value = input_event
-
-                if event_type != EV_KEY or event_code != button_code:
-                    continue
-
-                button_is_down = button_is_down_by_fd.get(key.fd, False)
-
-                if trace_matches and traces_emitted < trace_limit:
-                    print(
-                        "Listener button event: "
-                        f"device={key.data['devnode']} "
-                        f"code={config['button_name']} "
-                        f"value={describe_button_event_value(event_value)} "
-                        f"button_is_down={button_is_down}"
-                    )
-                    traces_emitted += 1
-
-                if event_value == 1 and not button_is_down:
-                    now = time.time()
-
-                    if now - last_trigger_at >= debounce_seconds:
-                        print(
-                            "Matched button press on "
-                            f"{key.data['devnode']}. Triggering TV action."
-                        )
-                        run_tv_action(target_input)
-                        last_trigger_at = now
-                    elif trace_matches and traces_emitted < trace_limit:
-                        print(
-                            "Listener match suppressed by debounce: "
-                            f"device={key.data['devnode']}"
-                        )
-                        traces_emitted += 1
-
-                    button_is_down_by_fd[key.fd] = True
-
-                elif event_value == 0:
-                    button_is_down_by_fd[key.fd] = False
-
-    finally:
-        close_event_devices(selector, handles)
-
-
-def debug_evdev_button(max_reports):
-    config = load_button_event_config()
-    devices = config["devices"]
-    button_code = config["button_code"]
-    device_list = ", ".join(device["devnode"] for device in devices)
-
-    log_button_event_config(config, mode="debug")
-    print(
-        "Debugging button events on "
-        f"{device_list} ({config['button_name']})..."
-    )
-
-    selector, handles = open_event_devices(devices)
-    seen = 0
-
-    try:
-        while max_reports <= 0 or seen < max_reports:
-            events = selector.select(timeout=0.5)
-
-            if not events:
-                continue
-
-            for key, _ in events:
-                input_event = read_input_event(key.fd)
-
-                if input_event is None:
-                    continue
-
-                _, _, event_type, event_code, event_value = input_event
-
-                if event_type != EV_KEY or event_code != button_code:
-                    continue
-
-                print(
-                    "button-event "
-                    f"device={key.data['devnode']} "
-                    f"code={config['button_name']} "
-                    f"value={describe_button_event_value(event_value)}"
-                )
-                seen += 1
-
-                if max_reports > 0 and seen >= max_reports:
-                    break
-
-    finally:
-        close_event_devices(selector, handles)
 
 
 def listen_for_hid_button(target_input):
@@ -1009,7 +758,11 @@ def listen_for_hid_button(target_input):
                 if not report:
                     continue
 
-                matched = report_matches(report, match, mask, offset)
+                matched = report_button_pressed(report, config)
+
+                if matched is None:
+                    continue
+
                 button_is_down = button_is_down_by_fd.get(key.fd, False)
                 consecutive_matches = consecutive_matches_by_fd.get(key.fd, 0)
                 consecutive_non_matches = consecutive_non_matches_by_fd.get(
@@ -1119,9 +872,6 @@ def listen_for_hid_button(target_input):
 def debug_hid_button(max_reports):
     config = load_button_config()
     devices = config["devices"]
-    match = config["match"]
-    mask = config["mask"]
-    offset = config["offset"]
     report_size = config["report_size"]
 
     log_button_config(config, mode="debug")
@@ -1129,9 +879,6 @@ def debug_hid_button(max_reports):
     device_list = ", ".join(device["devnode"] for device in devices)
     print(f"Debugging button reports on {device_list}...")
     print(f"report_size={report_size}")
-    print(f"match_offset={offset}")
-    print(f"match_hex={match.hex()}")
-    print(f"match_mask={mask.hex()}")
     print(f"match_streak={config['match_streak']}")
     print(f"release_streak={config['release_streak']}")
 
@@ -1152,12 +899,20 @@ def debug_hid_button(max_reports):
                 if not report:
                     continue
 
-                matched = report_matches(report, match, mask, offset)
+                matched = report_button_pressed(report, config)
+
+                if matched is None:
+                    continue
+
                 previous = previous_reports.get(key.fd)
 
                 if previous != (report, matched):
                     status = "MATCH" if matched else "no-match"
-                    window = format_match_window(report, offset, len(match))
+                    window = format_match_window(
+                        report,
+                        config["offset"],
+                        len(config["match"]),
+                    )
                     print(
                         f"{status} device={key.data['devnode']} "
                         f"report={report.hex()} window={window}"
@@ -1184,13 +939,11 @@ def parse_args():
         help="TV input ID to switch to after wake.",
     )
 
-    for command_name in ("listen-evdev-button", "listen-hid-button"):
+    for command_name in ("listen-hid-button", "listen-evdev-button"):
         listen_parser = subparsers.add_parser(
             command_name,
             help=(
-                argparse.SUPPRESS
-                if command_name == "listen-hid-button"
-                else None
+                argparse.SUPPRESS if command_name == "listen-evdev-button" else None
             ),
         )
         listen_parser.add_argument(
@@ -1200,13 +953,11 @@ def parse_args():
         help="TV input ID to switch to after a matched button event.",
         )
 
-    for command_name in ("debug-evdev-button", "debug-hid-button"):
+    for command_name in ("debug-hid-button", "debug-evdev-button"):
         debug_parser = subparsers.add_parser(
             command_name,
             help=(
-                argparse.SUPPRESS
-                if command_name == "debug-hid-button"
-                else None
+                argparse.SUPPRESS if command_name == "debug-evdev-button" else None
             ),
         )
         debug_parser.add_argument(
@@ -1229,12 +980,12 @@ def main():
     command = args.command or "run"
 
     if command in {"debug-evdev-button", "debug-hid-button"}:
-        if command == "debug-hid-button":
+        if command == "debug-evdev-button":
             print(
-                "debug-hid-button is deprecated. "
-                "Using documented evdev BTN_MODE events instead."
+                "debug-evdev-button is deprecated. "
+                "Using the raw Valve HID parser instead."
             )
-        debug_evdev_button(args.max_reports)
+        debug_hid_button(args.max_reports)
         return 0
 
     target_input = getattr(
@@ -1249,12 +1000,12 @@ def main():
         )
 
     if command in {"listen-evdev-button", "listen-hid-button"}:
-        if command == "listen-hid-button":
+        if command == "listen-evdev-button":
             print(
-                "listen-hid-button is deprecated. "
-                "Using documented evdev BTN_MODE events instead."
+                "listen-evdev-button is deprecated. "
+                "Using the raw Valve HID parser instead."
             )
-        listen_for_evdev_button(target_input)
+        listen_for_hid_button(target_input)
         return 0
 
     return run_tv_action(target_input)
