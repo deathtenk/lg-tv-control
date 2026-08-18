@@ -82,6 +82,8 @@ STEAM_HID_INTERFACES = {
     "0003:000028DE:00001304": ("/input2",),
 }
 BUTTON_NAME_STEAM = "STEAM"
+DEFAULT_STEAM_PRESS_REPORT = "440402000000"
+DEFAULT_STEAM_RELEASE_REPORT = "440302000000"
 
 
 def configure_stdio():
@@ -282,6 +284,18 @@ def load_button_config():
     devices = resolve_button_devices()
     button_name = os.environ.get("BUTTON_NAME", BUTTON_NAME_STEAM).strip().upper()
     match = parse_hex_bytes(os.environ.get("BUTTON_MATCH_HEX", "74"))
+    steam_press_report = parse_hex_bytes(
+        os.environ.get(
+            "BUTTON_STEAM_PRESS_HEX",
+            DEFAULT_STEAM_PRESS_REPORT,
+        )
+    )
+    steam_release_report = parse_hex_bytes(
+        os.environ.get(
+            "BUTTON_STEAM_RELEASE_HEX",
+            DEFAULT_STEAM_RELEASE_REPORT,
+        )
+    )
     mask_hex = os.environ.get("BUTTON_MATCH_MASK_HEX", "fe")
     offset = read_env_int("BUTTON_MATCH_OFFSET", 33)
     debounce_seconds = read_env_float(
@@ -327,6 +341,8 @@ def load_button_config():
         "match": match,
         "mask": mask,
         "offset": offset,
+        "steam_press_report": steam_press_report,
+        "steam_release_report": steam_release_report,
         "debounce_seconds": debounce_seconds,
         "report_size": report_size,
         "match_streak": match_streak,
@@ -348,6 +364,8 @@ def log_button_config(config, target_input=None, mode="listen"):
         f"match_offset={config['offset']} "
         f"match_hex={config['match'].hex()} "
         f"match_mask={config['mask'].hex()} "
+        f"steam_press_hex={config['steam_press_report'].hex()} "
+        f"steam_release_hex={config['steam_release_report'].hex()} "
         f"match_streak={config['match_streak']} "
         f"release_streak={config['release_streak']} "
         f"trace_matches={config['trace_matches']} "
@@ -673,6 +691,12 @@ def report_button_pressed(report, config):
     button_name = config["button_name"]
 
     if button_name == BUTTON_NAME_STEAM:
+        if report == config["steam_press_report"]:
+            return True
+
+        if report == config["steam_release_report"]:
+            return False
+
         return report_matches(
             report,
             config["match"],
