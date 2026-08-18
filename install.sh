@@ -62,11 +62,18 @@ for service in "${SERVICES[@]}"; do
 done
 
 echo "Installing service definitions..."
-cp -r ./lg-tv-control-resume.service "$SERVICE_DIRECTORY_PATH"
-cp -r ./lg-tv-control-steam-button.service "$SERVICE_DIRECTORY_PATH"
+sudo install -d -m 0755 "$SERVICE_DIRECTORY_PATH"
+sudo install -m 0644 \
+  ./lg-tv-control-resume.service \
+  "$SERVICE_DIRECTORY_PATH/lg-tv-control-resume.service"
+sudo install -m 0644 \
+  ./lg-tv-control-steam-button.service \
+  "$SERVICE_DIRECTORY_PATH/lg-tv-control-steam-button.service"
 
 if [[ "$ENABLE_DEBUG_SERVICE" == "true" ]]; then
-  cp -r ./lg-tv-control-debug.service "$SERVICE_DIRECTORY_PATH"
+  sudo install -m 0644 \
+    ./lg-tv-control-debug.service \
+    "$SERVICE_DIRECTORY_PATH/lg-tv-control-debug.service"
 fi
 
 sudo systemctl daemon-reload
